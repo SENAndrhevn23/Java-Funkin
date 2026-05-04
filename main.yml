@@ -9,13 +9,17 @@
     cp -r Assets staging/ || true
     cp -r Notes staging/ || true
 
-    # IMPORTANT: correct manifest (double newline matters)
+    # correct manifest (THIS is critical)
     printf "Manifest-Version: 1.0\nMain-Class: Main\n\n" > manifest.txt
 
-    # build jar
+    # verify manifest BEFORE building
+    echo "===== MANIFEST FILE ====="
+    cat manifest.txt
+
+    # build JAR correctly (THIS is the key fix)
     jar cfm FNF-JAVA-ENGINE.jar manifest.txt -C staging .
 
-    # DEBUG: show manifest inside jar (THIS WILL CONFIRM FIX)
+    # verify inside jar
+    echo "===== INSIDE JAR MANIFEST ====="
     jar xf FNF-JAVA-ENGINE.jar META-INF/MANIFEST.MF
-    echo "===== MANIFEST INSIDE JAR ====="
     cat META-INF/MANIFEST.MF
