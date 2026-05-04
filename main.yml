@@ -1,23 +1,21 @@
-- name: Build runnable JAR (FIXED CLEAN)
+- name: Build runnable JAR (FINAL FIX)
   run: |
     set -e
 
-    # 1. Create clean staging folder
     rm -rf staging
     mkdir staging
 
-    # 2. Copy compiled classes
     cp -r out/* staging/
-
-    # 3. Copy assets
     cp -r Assets staging/ || true
     cp -r Notes staging/ || true
 
-    # 4. DO NOT unpack jars anymore (IMPORTANT FIX)
-    # gson/json should stay as external libs OR be shaded properly
-
-    # 5. Create MANIFEST properly
+    # IMPORTANT: correct manifest (double newline matters)
     printf "Manifest-Version: 1.0\nMain-Class: Main\n\n" > manifest.txt
 
-    # 6. Build final jar
+    # build jar
     jar cfm FNF-JAVA-ENGINE.jar manifest.txt -C staging .
+
+    # DEBUG: show manifest inside jar (THIS WILL CONFIRM FIX)
+    jar xf FNF-JAVA-ENGINE.jar META-INF/MANIFEST.MF
+    echo "===== MANIFEST INSIDE JAR ====="
+    cat META-INF/MANIFEST.MF
