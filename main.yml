@@ -1,4 +1,4 @@
-- name: Build runnable JAR (FINAL FIX)
+- name: Build runnable JAR (HARD FIX)
   run: |
     set -e
 
@@ -9,17 +9,18 @@
     cp -r Assets staging/ || true
     cp -r Notes staging/ || true
 
-    # correct manifest (THIS is critical)
-    printf "Manifest-Version: 1.0\nMain-Class: Main\n\n" > manifest.txt
+    # create MANIFEST (must be exact)
+    mkdir -p manifest_dir/META-INF
 
-    # verify manifest BEFORE building
-    echo "===== MANIFEST FILE ====="
-    cat manifest.txt
+    printf "Manifest-Version: 1.0\nMain-Class: Main\n\n" > manifest_dir/META-INF/MANIFEST.MF
 
-    # build JAR correctly (THIS is the key fix)
-    jar cfm FNF-JAVA-ENGINE.jar manifest.txt -C staging .
+    echo "=== MANIFEST CHECK ==="
+    cat manifest_dir/META-INF/MANIFEST.MF
 
-    # verify inside jar
-    echo "===== INSIDE JAR MANIFEST ====="
+    # build JAR using MANIFEST DIRECTORY (this is the KEY FIX)
+    jar cfm FNF-JAVA-ENGINE.jar manifest_dir/META-INF/MANIFEST.MF -C staging .
+
+    # verify result
+    echo "=== FINAL MANIFEST INSIDE JAR ==="
     jar xf FNF-JAVA-ENGINE.jar META-INF/MANIFEST.MF
     cat META-INF/MANIFEST.MF
