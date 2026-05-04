@@ -9,21 +9,37 @@ import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
 import java.io.*;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.util.Arrays;
-import java.util.Locale;
+import java.nio.file.*;
+import java.util.*;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
+/**
+ * Refactored PlayState focused on:
+ * - merged charts: song.json + song-2.json + song-3.json ...
+ * - scroll speed read from JSON "speed"
+ * - visible-window rendering only
+ * - chunked note storage with chunk dropping after notes are behind the playhead
+ *
+ * Notes:
+ * - This is designed to avoid O(total notes) work per frame.
+ * - Truly massive charts still depend on RAM and the size of the chart file(s).
+ * - For extreme charts, the next step would be a disk-backed streaming index.
+ */
 public class PlayState extends JPanel implements KeyListener {
     private static final int SCREEN_W = 1280;
     private static final int SCREEN_H = 720;
+
     private static final int NPS_WINDOW_MS = 1000;
     private static final int STREAM_KEEP_BEHIND_MS = 5000;
     private static final int MISS_DRAW_PADDING = 120;
     private static final int HIT_Y = 100;
     private static final int FINAL_RENDER_PADDING_MS = 5000;
 
-    private static final int MAX_BUFFERED_NOTES = 250_000;
+    // Tune this up/down depending on your RAM and how long you keep old notes around.
+    private static final int MAX_BUFFERED_NOTES = 1_500_000;
+    private static final int CHUNK_SIZE = 8192;
 
     private final JFrame frame;
     private final String songName;
@@ -69,7 +85,7 @@ public class PlayState extends JPanel implements KeyListener {
     private long maxMemoryMB = 0;
 
     private final double baseScrollSpeed = 0.45;
-    private double songSpeed = 10;
+    private double songSpeed = 10.0;
     private double renderSpeed = 1.0;
 
     private final int hitWindowMs = 150;
@@ -115,27 +131,52 @@ public class PlayState extends JPanel implements KeyListener {
             KeyEvent.VK_CLOSE_BRACKET, KeyEvent.VK_MINUS, KeyEvent.VK_EQUALS, KeyEvent.VK_BACK_SLASH, KeyEvent.VK_BACK_QUOTE
     };
 
+    private static final class Note {
+        final double time;
+        final float sustain;
+
+        Note(double time, float sustain) {
+            this.time = time;
+            this.sustain = sustain;
+        }
+    }
+
+    /**
+     * Chunked notes per lane.
+     * Good for huge charts because we can drop whole chunks that are entirely behind the playhead.
+     */
     private static final class LaneStream {
-        private double[] times = new double[4096];
-        private float[] sustains = new float[4096];
-        private int size = 0;
+        private final ArrayList<double[]> timeChunks = new ArrayList<>();
+        private final ArrayList<float[]> sustainChunks = new ArrayList<>();
+        private final ArrayList<Integer> chunkSizes = new ArrayList<>();
+        private final ArrayList<Double> chunkMaxTimes = new ArrayList<>();
+
+        private int totalSize = 0;
+        private int headChunk = 0;
+        private int headIndex = 0;
         private int hitCursor = 0;
         private int npsStart = 0;
         private int npsEnd = 0;
 
         synchronized void add(double time, float sustain) {
-            if (size >= times.length) {
-                int newCap = Math.max(size + 1, times.length << 1);
-                times = Arrays.copyOf(times, newCap);
-                sustains = Arrays.copyOf(sustains, newCap);
+            if (timeChunks.isEmpty() || chunkSizes.get(chunkSizes.size() - 1) >= CHUNK_SIZE) {
+                timeChunks.add(new double[CHUNK_SIZE]);
+                sustainChunks.add(new float[CHUNK_SIZE]);
+                chunkSizes.add(0);
+                chunkMaxTimes.add(Double.NEGATIVE_INFINITY);
             }
-            times[size] = time;
-            sustains[size] = sustain;
-            size++;
+
+            int last = timeChunks.size() - 1;
+            int idx = chunkSizes.get(last);
+            timeChunks.get(last)[idx] = time;
+            sustainChunks.get(last)[idx] = sustain;
+            chunkSizes.set(last, idx + 1);
+            chunkMaxTimes.set(last, time);
+            totalSize++;
         }
 
         synchronized int size() {
-            return size;
+            return totalSize;
         }
 
         synchronized int hitCursor() {
@@ -143,44 +184,42 @@ public class PlayState extends JPanel implements KeyListener {
         }
 
         synchronized void setHitCursor(int value) {
-            hitCursor = value;
+            hitCursor = Math.max(0, value);
         }
 
-        synchronized int npsStart() {
-            return npsStart;
-        }
+        synchronized int npsStart() { return npsStart; }
+        synchronized void setNpsStart(int value) { npsStart = Math.max(0, value); }
+        synchronized int npsEnd() { return npsEnd; }
+        synchronized void setNpsEnd(int value) { npsEnd = Math.max(0, value); }
 
-        synchronized void setNpsStart(int value) {
-            npsStart = value;
-        }
-
-        synchronized int npsEnd() {
-            return npsEnd;
-        }
-
-        synchronized void setNpsEnd(int value) {
-            npsEnd = value;
-        }
-
-        synchronized double timeAt(int index) {
-            return times[index];
+        synchronized double timeAt(int globalIndex) {
+            if (globalIndex < 0 || globalIndex >= totalSize) {
+                throw new IndexOutOfBoundsException("Index: " + globalIndex + " size: " + totalSize);
+            }
+            int idx = globalIndex;
+            for (int c = 0; c < timeChunks.size(); c++) {
+                int sz = chunkSizes.get(c);
+                if (idx < sz) return timeChunks.get(c)[idx];
+                idx -= sz;
+            }
+            throw new IndexOutOfBoundsException("Index mapping failed");
         }
 
         synchronized int lowerBound(double value) {
-            int lo = 0, hi = size;
+            int lo = 0, hi = totalSize;
             while (lo < hi) {
                 int mid = (lo + hi) >>> 1;
-                if (times[mid] < value) lo = mid + 1;
+                if (timeAt(mid) < value) lo = mid + 1;
                 else hi = mid;
             }
             return lo;
         }
 
         synchronized int upperBound(double value) {
-            int lo = 0, hi = size;
+            int lo = 0, hi = totalSize;
             while (lo < hi) {
                 int mid = (lo + hi) >>> 1;
-                if (times[mid] <= value) lo = mid + 1;
+                if (timeAt(mid) <= value) lo = mid + 1;
                 else hi = mid;
             }
             return lo;
@@ -193,30 +232,41 @@ public class PlayState extends JPanel implements KeyListener {
         }
 
         synchronized int compactBefore(double minTime) {
-            int removeUntil = 0;
-            while (removeUntil < size && times[removeUntil] < minTime) {
-                removeUntil++;
+            int removed = 0;
+
+            while (headChunk < timeChunks.size()) {
+                int sz = chunkSizes.get(headChunk);
+                if (sz <= 0) {
+                    dropHeadChunk();
+                    continue;
+                }
+
+                double maxTime = chunkMaxTimes.get(headChunk);
+                if (maxTime >= minTime) break;
+
+                removed += sz;
+                dropHeadChunk();
             }
 
-            if (removeUntil <= 0) return 0;
-
-            if (removeUntil >= size) {
-                int removed = size;
-                size = 0;
-                hitCursor = 0;
-                npsStart = 0;
-                npsEnd = 0;
-                return removed;
+            if (removed > 0) {
+                totalSize -= removed;
+                hitCursor = Math.max(0, hitCursor - removed);
+                npsStart = Math.max(0, npsStart - removed);
+                npsEnd = Math.max(0, npsEnd - removed);
             }
 
-            int remaining = size - removeUntil;
-            System.arraycopy(times, removeUntil, times, 0, remaining);
-            System.arraycopy(sustains, removeUntil, sustains, 0, remaining);
-            size = remaining;
-            hitCursor = Math.max(0, hitCursor - removeUntil);
-            npsStart = Math.max(0, npsStart - removeUntil);
-            npsEnd = Math.max(0, npsEnd - removeUntil);
-            return removeUntil;
+            if (hitCursor < 0) hitCursor = 0;
+            if (npsStart < 0) npsStart = 0;
+            if (npsEnd < 0) npsEnd = 0;
+            return removed;
+        }
+
+        private void dropHeadChunk() {
+            timeChunks.remove(headChunk);
+            sustainChunks.remove(headChunk);
+            chunkSizes.remove(headChunk);
+            chunkMaxTimes.remove(headChunk);
+            headIndex = 0;
         }
     }
 
@@ -300,9 +350,7 @@ public class PlayState extends JPanel implements KeyListener {
 
     private int[] buildLaneKeys(int count) {
         int[] keys = new int[count];
-        for (int i = 0; i < count; i++) {
-            keys[i] = KEY_POOL[i % KEY_POOL.length];
-        }
+        for (int i = 0; i < count; i++) keys[i] = KEY_POOL[i % KEY_POOL.length];
         return keys;
     }
 
@@ -460,9 +508,7 @@ public class PlayState extends JPanel implements KeyListener {
         System.out.println("[RENDER] FINISHED! Video saved to Video/" + songName + ".mp4");
         try {
             File videoFolder = new File("Video");
-            if (Desktop.isDesktopSupported()) {
-                Desktop.getDesktop().open(videoFolder);
-            }
+            if (Desktop.isDesktopSupported()) Desktop.getDesktop().open(videoFolder);
         } catch (Exception ignored) {
         }
         SwingUtilities.invokeLater(MainMenu::new);
@@ -504,7 +550,7 @@ public class PlayState extends JPanel implements KeyListener {
     }
 
     private void resetChart() {
-        songSpeed = 10;
+        songSpeed = 10.0;
         renderSpeed = 1.0;
         songTimeMs = 0.0;
         lastUpdateNano = System.nanoTime();
@@ -520,14 +566,8 @@ public class PlayState extends JPanel implements KeyListener {
 
         synchronized (laneLock) {
             for (int i = 0; i < laneCount; i++) {
-                playerLanes[i].compactBefore(Double.POSITIVE_INFINITY);
-                opponentLanes[i].compactBefore(Double.POSITIVE_INFINITY);
-                playerLanes[i].setHitCursor(0);
-                opponentLanes[i].setHitCursor(0);
-                playerLanes[i].setNpsStart(0);
-                playerLanes[i].setNpsEnd(0);
-                opponentLanes[i].setNpsStart(0);
-                opponentLanes[i].setNpsEnd(0);
+                playerLanes[i] = new LaneStream();
+                opponentLanes[i] = new LaneStream();
                 playerGlow[i] = 0;
                 opponentGlow[i] = 0;
                 playerHeld[i] = false;
@@ -577,9 +617,7 @@ public class PlayState extends JPanel implements KeyListener {
         processPlayerNotes(songTime);
         cleanupOldNotes(songTime);
 
-        if (renderMode && isChartDrained(songTime)) {
-            finishRendering();
-        }
+        if (renderMode && isChartDrained(songTime)) finishRendering();
     }
 
     private void processOpponentNotes(long songTime) {
@@ -722,17 +760,24 @@ public class PlayState extends JPanel implements KeyListener {
 
     private void loadSongJSON(String song) {
         resetChart();
-        String path = "Assets/Songs/" + song + "/test.json";
-
         parserStarted = true;
         parserError = false;
         chartParsingFinished = false;
 
         Thread parserThread = new Thread(() -> {
-            try (InputStream in = new BufferedInputStream(Files.newInputStream(Paths.get(path)), 1 << 20)) {
-                new ChartParser(in).parse();
-                System.out.println("Loaded notes: " + totalNotes);
-                System.out.println("Song Speed fixed to settings speed: " + songSpeed);
+            try {
+                List<Path> chartFiles = findChartFiles(song);
+                if (chartFiles.isEmpty()) throw new FileNotFoundException("No chart JSON found for song: " + song);
+
+                for (Path chart : chartFiles) {
+                    try (InputStream in = new BufferedInputStream(Files.newInputStream(chart), 1 << 20)) {
+                        new ChartParser(in).parse();
+                        System.out.println("[CHART] Loaded: " + chart.getFileName());
+                    }
+                }
+
+                System.out.println("[CHART] Total notes loaded: " + totalNotes);
+                System.out.println("[CHART] Scroll speed: " + songSpeed);
             } catch (Exception e) {
                 parserError = true;
                 e.printStackTrace();
@@ -747,6 +792,47 @@ public class PlayState extends JPanel implements KeyListener {
 
         parserThread.setDaemon(true);
         parserThread.start();
+    }
+
+    private List<Path> findChartFiles(String song) throws IOException {
+        Path dir = Paths.get("Assets", "Songs", song);
+        if (!Files.isDirectory(dir)) throw new FileNotFoundException("Song folder not found: " + dir.toAbsolutePath());
+
+        List<Path> files = new ArrayList<>();
+        Path base = dir.resolve(song + ".json");
+        Path test = dir.resolve("test.json");
+
+        if (Files.exists(base)) files.add(base);
+        else if (Files.exists(test)) files.add(test);
+
+        Pattern splitPattern = Pattern.compile(Pattern.quote(song) + "-(\\d+)\\.json", Pattern.CASE_INSENSITIVE);
+
+        try (var stream = Files.list(dir)) {
+            stream.filter(p -> Files.isRegularFile(p) && p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".json"))
+                    .forEach(p -> {
+                        String name = p.getFileName().toString();
+                        Matcher m = splitPattern.matcher(name);
+                        if (m.matches()) files.add(p);
+                    });
+        }
+
+        files.sort(Comparator.comparingInt(p -> chartPartIndex(p.getFileName().toString(), song)));
+        return files;
+    }
+
+    private int chartPartIndex(String fileName, String song) {
+        if (fileName.equalsIgnoreCase(song + ".json")) return 0;
+        if (fileName.equalsIgnoreCase("test.json")) return 0;
+
+        Pattern splitPattern = Pattern.compile(Pattern.quote(song) + "-(\\d+)\\.json", Pattern.CASE_INSENSITIVE);
+        Matcher m = splitPattern.matcher(fileName);
+        if (m.matches()) {
+            try {
+                return Integer.parseInt(m.group(1));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return Integer.MAX_VALUE;
     }
 
     private final class ChartParser {
@@ -781,9 +867,7 @@ public class PlayState extends JPanel implements KeyListener {
         }
 
         private int peek() throws IOException {
-            if (peeked == Integer.MIN_VALUE) {
-                peeked = read();
-            }
+            if (peeked == Integer.MIN_VALUE) peeked = read();
             return peeked;
         }
 
@@ -797,17 +881,13 @@ public class PlayState extends JPanel implements KeyListener {
 
         private void expect(char expected) throws IOException {
             int c = read();
-            if (c != expected) {
-                throw new IOException("Expected '" + expected + "' but found '" + (char) c + "'");
-            }
+            if (c != expected) throw new IOException("Expected '" + expected + "' but found '" + (char) c + "'");
         }
 
         private void readLiteral(String literal) throws IOException {
             for (int i = 0; i < literal.length(); i++) {
                 int c = read();
-                if (c != literal.charAt(i)) {
-                    throw new IOException("Expected literal: " + literal);
-                }
+                if (c != literal.charAt(i)) throw new IOException("Expected literal: " + literal);
             }
         }
 
@@ -819,7 +899,6 @@ public class PlayState extends JPanel implements KeyListener {
                 if (c < 0) throw new IOException("Unexpected EOF inside string");
                 char ch = (char) c;
                 if (ch == '"') break;
-
                 if (ch == '\\') {
                     int esc = read();
                     if (esc < 0) throw new IOException("Unexpected EOF in escape sequence");
@@ -1018,8 +1097,9 @@ public class PlayState extends JPanel implements KeyListener {
 
                 skipWs();
 
+                // Support common chart metadata.
                 if ("speed".equals(key)) {
-                    skipValue();
+                    songSpeed = readNumber();
                 } else if ("mustHitSection".equals(key)) {
                     localMustHit = readBoolean();
                 } else if ("sectionNotes".equals(key)) {
@@ -1141,9 +1221,7 @@ public class PlayState extends JPanel implements KeyListener {
             skipToEndOfArray();
 
             if (rawLane < 0) rawLane = 0;
-            if (MainMenu.infiniteKeys) {
-                ensureLaneCount(rawLane + 1);
-            }
+            if (MainMenu.infiniteKeys) ensureLaneCount(rawLane + 1);
 
             int lane;
             synchronized (laneLock) {
@@ -1177,9 +1255,7 @@ public class PlayState extends JPanel implements KeyListener {
             ensureLaneCount(lane + 1);
         } else {
             synchronized (laneLock) {
-                if (lane >= laneCount) {
-                    lane = Math.floorMod(lane, laneCount);
-                }
+                if (lane >= laneCount) lane = Math.floorMod(lane, laneCount);
             }
         }
 
@@ -1196,11 +1272,8 @@ public class PlayState extends JPanel implements KeyListener {
             }
 
             synchronized (laneLock) {
-                if (mustHit) {
-                    playerLanes[lane].add(time, (float) sustain);
-                } else {
-                    opponentLanes[lane].add(time, (float) sustain);
-                }
+                if (mustHit) playerLanes[lane].add(time, (float) sustain);
+                else opponentLanes[lane].add(time, (float) sustain);
             }
 
             bufferedNotes++;
@@ -1261,9 +1334,7 @@ public class PlayState extends JPanel implements KeyListener {
         int digitH = 72;
         int commaW = 26;
         int totalW = 0;
-        for (int i = 0; i < text.length(); i++) {
-            totalW += (text.charAt(i) == ',') ? commaW : digitW;
-        }
+        for (int i = 0; i < text.length(); i++) totalW += (text.charAt(i) == ',') ? commaW : digitW;
 
         int x = (SCREEN_W - totalW) / 2;
         int y = 290 - ((popupMaxFrames - popupFrames) * 2);
@@ -1275,9 +1346,7 @@ public class PlayState extends JPanel implements KeyListener {
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
             if (c == ',') {
-                if (numberComma != null) {
-                    g2.drawImage(numberComma, x, y + 18, commaW, digitH - 18, null);
-                }
+                if (numberComma != null) g2.drawImage(numberComma, x, y + 18, commaW, digitH - 18, null);
                 x += commaW;
             } else {
                 int idx = c - '0';
@@ -1309,6 +1378,10 @@ public class PlayState extends JPanel implements KeyListener {
         g2.drawImage(img, at, null);
     }
 
+    /**
+     * Visible-window-only note drawing.
+     * Only notes that can appear on screen are touched.
+     */
     private void drawLaneNotes(Graphics2D g2, boolean isPlayer, double baseX, long songTime, double finalSpeed, Layout layout) {
         LaneStream[] laneArr;
         int[] dirs;
@@ -1319,17 +1392,19 @@ public class PlayState extends JPanel implements KeyListener {
             count = laneCount;
         }
 
+        double visibleTopTime = songTime - (MISS_DRAW_PADDING / finalSpeed) - 200.0;
+        double visibleBottomTime = songTime + ((SCREEN_H - HIT_Y) / finalSpeed) + 200.0;
+
         for (int lane = 0; lane < count; lane++) {
             double x = baseX + (lane * layout.spacing);
             LaneStream stream = laneArr[lane];
-            int cursor = stream.hitCursor();
-            int size = stream.size();
+            int start = Math.max(stream.hitCursor(), stream.lowerBound(visibleTopTime));
+            int end = stream.lowerBound(visibleBottomTime);
 
-            for (int j = cursor; j < size; j++) {
+            for (int j = start; j < end; j++) {
                 double noteTime = stream.timeAt(j);
                 double y = HIT_Y + (noteTime - songTime) * finalSpeed;
-                if (y > SCREEN_H) break;
-                if (y > -MISS_DRAW_PADDING) {
+                if (y > -MISS_DRAW_PADDING && y < SCREEN_H + MISS_DRAW_PADDING) {
                     drawImageScaled(g2, getComing(dirs[lane]), x, y, layout.noteSize, layout.noteSize);
                 }
             }
@@ -1437,9 +1512,7 @@ public class PlayState extends JPanel implements KeyListener {
         int lane = laneFromKey(e.getKeyCode());
         if (lane >= 0) {
             synchronized (laneLock) {
-                if (lane < laneCount) {
-                    playerHeld[lane] = true;
-                }
+                if (lane < laneCount) playerHeld[lane] = true;
             }
             tryHit(lane);
             return;
@@ -1459,9 +1532,7 @@ public class PlayState extends JPanel implements KeyListener {
         int lane = laneFromKey(e.getKeyCode());
         if (lane >= 0) {
             synchronized (laneLock) {
-                if (lane < laneCount) {
-                    playerHeld[lane] = false;
-                }
+                if (lane < laneCount) playerHeld[lane] = false;
             }
         }
     }
