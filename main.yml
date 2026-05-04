@@ -11,51 +11,64 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Checkout repo
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 2. Java setup
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
+      # 3. Install FFmpeg (optional but you had it)
       - name: Install FFmpeg
         run: |
           sudo apt update
           sudo apt install -y ffmpeg
 
+      # 4. Compile ALL Java files
       - name: Compile Java
         run: |
           mkdir -p out
           find . -name "*.java" > sources.txt
-          javac -cp ".:gson-2.10.1.jar:json-20231013.jar" -d out @sources.txt
+          javac -encoding UTF-8 -cp ".:gson-2.10.1.jar:json-20231013.jar" -d out @sources.txt
 
-      - name: Prepare fat jar folder
+      # 5. Prepare build folder
+      - name: Prepare build
         run: |
           mkdir -p build
 
           # compiled classes
           cp -r out/* build/
 
-          # assets (IMPORTANT: preserve structure)
+          # GAME FILES (VERY IMPORTANT)
           cp -r Assets build/
           cp -r Notes build/
-          cp -r Source build/
-          
-      - name: Unpack dependencies into jar
+
+          # optional extras
+          [ -f test.json ] && cp test.json build/
+
+      # 6. Merge dependency jars (fat jar)
+      - name: Merge dependencies
         run: |
           cd build
           jar xf ../gson-2.10.1.jar || true
           jar xf ../json-20231013.jar || true
           cd ..
 
-      - name: Create runnable JAR
+      # 7. Create proper manifest + jar
+      - name: Build runnable JAR
         run: |
-          echo "Main-Class: Main" > manifest.txt
+          # FIXED manifest (this solves your error)
+          printf "Main-Class: Main\n\n" > manifest.txt
+
+          # build jar
           jar cfm FNF-JAVA-ENGINE.jar manifest.txt -C build .
 
-      - name: Upload artifact
+      # 8. Upload artifact
+      - name: Upload build
         uses: actions/upload-artifact@v4
         with:
           name: FNF-JAVA-ENGINE
