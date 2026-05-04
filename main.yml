@@ -1,75 +1,23 @@
-name: Build FNF JAVA ENGINE
+- name: Build runnable JAR (FIXED CLEAN)
+  run: |
+    set -e
 
-on:
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
+    # 1. Create clean staging folder
+    rm -rf staging
+    mkdir staging
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
+    # 2. Copy compiled classes
+    cp -r out/* staging/
 
-    steps:
-      # 1. Checkout repo
-      - name: Checkout code
-        uses: actions/checkout@v4
+    # 3. Copy assets
+    cp -r Assets staging/ || true
+    cp -r Notes staging/ || true
 
-      # 2. Java setup
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
+    # 4. DO NOT unpack jars anymore (IMPORTANT FIX)
+    # gson/json should stay as external libs OR be shaded properly
 
-      # 3. Install FFmpeg (optional but you had it)
-      - name: Install FFmpeg
-        run: |
-          sudo apt update
-          sudo apt install -y ffmpeg
+    # 5. Create MANIFEST properly
+    printf "Manifest-Version: 1.0\nMain-Class: Main\n\n" > manifest.txt
 
-      # 4. Compile ALL Java files
-      - name: Compile Java
-        run: |
-          mkdir -p out
-          find . -name "*.java" > sources.txt
-          javac -encoding UTF-8 -cp ".:gson-2.10.1.jar:json-20231013.jar" -d out @sources.txt
-
-      # 5. Prepare build folder
-      - name: Prepare build
-        run: |
-          mkdir -p build
-
-          # compiled classes
-          cp -r out/* build/
-
-          # GAME FILES (VERY IMPORTANT)
-          cp -r Assets build/
-          cp -r Notes build/
-
-          # optional extras
-          [ -f test.json ] && cp test.json build/
-
-      # 6. Merge dependency jars (fat jar)
-      - name: Merge dependencies
-        run: |
-          cd build
-          jar xf ../gson-2.10.1.jar || true
-          jar xf ../json-20231013.jar || true
-          cd ..
-
-      # 7. Create proper manifest + jar
-      - name: Build runnable JAR
-        run: |
-          # FIXED manifest (this solves your error)
-          printf "Main-Class: Main\n\n" > manifest.txt
-
-          # build jar
-          jar cfm FNF-JAVA-ENGINE.jar manifest.txt -C build .
-
-      # 8. Upload artifact
-      - name: Upload build
-        uses: actions/upload-artifact@v4
-        with:
-          name: FNF-JAVA-ENGINE
-          path: FNF-JAVA-ENGINE.jar
+    # 6. Build final jar
+    jar cfm FNF-JAVA-ENGINE.jar manifest.txt -C staging .
