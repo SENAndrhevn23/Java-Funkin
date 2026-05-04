@@ -2,48 +2,60 @@ name: Build FNF JAVA ENGINE
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout repo
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. Set up Java
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      # 3. Install FFmpeg (needed for rendering mode)
       - name: Install FFmpeg
         run: |
           sudo apt update
           sudo apt install -y ffmpeg
 
-      # 4. Compile Java source files
-      - name: Compile Java project
+      - name: Compile Java
         run: |
           mkdir -p out
-          javac -cp ".:gson-2.10.1.jar:json-20231013.jar" -d out \
-            Main.java \
-            Source/**/*.java \
-            Source/*.java
+          find . -name "*.java" > sources.txt
+          javac -cp ".:gson-2.10.1.jar:json-20231013.jar" -d out @sources.txt
 
-      # 5. Package into runnable JAR
-      - name: Build JAR
+      - name: Prepare fat jar folder
         run: |
-          jar --create --file FNF-JAVA-ENGINE.jar -C out .
+          mkdir -p build
 
-      # 6. Upload build artifact
-      - name: Upload build
+          # compiled classes
+          cp -r out/* build/
+
+          # assets (IMPORTANT: preserve structure)
+          cp -r Assets build/
+          cp -r Notes build/
+          cp -r Source build/
+          
+      - name: Unpack dependencies into jar
+        run: |
+          cd build
+          jar xf ../gson-2.10.1.jar || true
+          jar xf ../json-20231013.jar || true
+          cd ..
+
+      - name: Create runnable JAR
+        run: |
+          echo "Main-Class: Main" > manifest.txt
+          jar cfm FNF-JAVA-ENGINE.jar manifest.txt -C build .
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: FNF-JAVA-ENGINE
