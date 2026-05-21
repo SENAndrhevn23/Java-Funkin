@@ -1,0 +1,41 @@
+plugins {
+    id 'java'
+}
+
+group = 'fnfjava'
+version = '1.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation files(
+        'gson-2.10.1.jar',
+        'json-20231013.jar'
+    )
+}
+
+sourceSets {
+    main {
+        java {
+            srcDirs = ['.', 'Source']
+        }
+    }
+}
+
+jar {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+    manifest {
+        attributes(
+            'Main-Class': 'Main'
+        )
+    }
+
+    from {
+        configurations.runtimeClasspath.collect {
+            it.isDirectory() ? it : zipTree(it)
+        }
+    }
+}
