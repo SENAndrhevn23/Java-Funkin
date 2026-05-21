@@ -1,26 +1,50 @@
-- name: Build runnable JAR (HARD FIX)
-  run: |
-    set -e
+name: Build FNF JAVA ENGINE
 
-    rm -rf staging
-    mkdir staging
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
-    cp -r out/* staging/
-    cp -r Assets staging/ || true
-    cp -r Notes staging/ || true
+jobs:
+  build:
+    runs-on: ubuntu-latest
 
-    # create MANIFEST (must be exact)
-    mkdir -p manifest_dir/META-INF
+    steps:
+      # 1. Checkout repo
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    printf "Manifest-Version: 1.0\nMain-Class: Main\n\n" > manifest_dir/META-INF/MANIFEST.MF
+      # 2. Set up Java
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
 
-    echo "=== MANIFEST CHECK ==="
-    cat manifest_dir/META-INF/MANIFEST.MF
+      # 3. Install FFmpeg (needed for rendering mode)
+      - name: Install FFmpeg
+        run: |
+          sudo apt update
+          sudo apt install -y ffmpeg
 
-    # build JAR using MANIFEST DIRECTORY (this is the KEY FIX)
-    jar cfm FNF-JAVA-ENGINE.jar manifest_dir/META-INF/MANIFEST.MF -C staging .
+      # 4. Compile Java source files
+      - name: Compile Java project
+        run: |
+          mkdir -p out
+          javac -cp ".:gson-2.10.1.jar:json-20231013.jar" -d out \
+            Main.java \
+            Source/**/*.java \
+            Source/*.java
 
-    # verify result
-    echo "=== FINAL MANIFEST INSIDE JAR ==="
-    jar xf FNF-JAVA-ENGINE.jar META-INF/MANIFEST.MF
-    cat META-INF/MANIFEST.MF
+      # 5. Package into runnable JAR
+      - name: Build JAR
+        run: |
+          jar --create --file FNF-JAVA-ENGINE.jar -C out .
+
+      # 6. Upload build artifact
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: FNF-JAVA-ENGINE
+          path: FNF-JAVA-ENGINE.jar

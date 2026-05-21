@@ -1,0 +1,160 @@
+andre@HP-Laptop-15-dy2xxx:~/Music/FNF-JAVA-ENGINE$ javac Main.java
+./Source/ChartEditor.java:3: error: package com.google.gson does not exist
+import com.google.gson.Gson;
+                      ^
+./Source/ChartEditor.java:4: error: package com.google.gson does not exist
+import com.google.gson.GsonBuilder;
+                      ^
+./Source/ChartEditor.java:5: error: package com.google.gson does not exist
+import com.google.gson.JsonArray;
+                      ^
+./Source/ChartEditor.java:6: error: package com.google.gson does not exist
+import com.google.gson.JsonElement;
+                      ^
+./Source/ChartEditor.java:7: error: package com.google.gson does not exist
+import com.google.gson.JsonObject;
+                      ^
+./Source/ChartEditor.java:8: error: package com.google.gson does not exist
+import com.google.gson.JsonParser;
+                      ^
+./Source/ChartEditor.java:56: error: cannot find symbol
+    private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+                  ^
+  symbol:   class Gson
+  location: class ChartEditor
+./Source/ChartEditor.java:56: error: cannot find symbol
+    private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+                                  ^
+  symbol:   class GsonBuilder
+  location: class ChartEditor
+./Source/ChartEditor.java:298: error: cannot find symbol
+            JsonElement parsed = JsonParser.parseString(raw);
+            ^
+  symbol:   class JsonElement
+  location: class ChartEditor
+./Source/ChartEditor.java:298: error: cannot find symbol
+            JsonElement parsed = JsonParser.parseString(raw);
+                                 ^
+  symbol:   variable JsonParser
+  location: class ChartEditor
+./Source/ChartEditor.java:299: error: cannot find symbol
+            JsonObject root = parsed.getAsJsonObject();
+            ^
+  symbol:   class JsonObject
+  location: class ChartEditor
+./Source/ChartEditor.java:300: error: cannot find symbol
+            JsonObject songObj = root.has("song") && root.get("song").isJsonObject() ? root.getAsJsonObject("song") : root;
+            ^
+  symbol:   class JsonObject
+  location: class ChartEditor
+./Source/ChartEditor.java:308: error: cannot find symbol
+            JsonArray sections = songObj.has("notes") && songObj.get("notes").isJsonArray() ? songObj.getAsJsonArray("notes") : new JsonArray();
+            ^
+  symbol:   class JsonArray
+  location: class ChartEditor
+./Source/ChartEditor.java:308: error: cannot find symbol
+            JsonArray sections = songObj.has("notes") && songObj.get("notes").isJsonArray() ? songObj.getAsJsonArray("notes") : new JsonArray();
+                                                                                                                                    ^
+  symbol:   class JsonArray
+  location: class ChartEditor
+./Source/ChartEditor.java:310: error: cannot find symbol
+            for (JsonElement secEl : sections) {
+                 ^
+  symbol:   class JsonElement
+  location: class ChartEditor
+./Source/ChartEditor.java:315: error: cannot find symbol
+                JsonObject secObj = secEl.getAsJsonObject();
+                ^
+  symbol:   class JsonObject
+  location: class ChartEditor
+./Source/ChartEditor.java:320: error: cannot find symbol
+                JsonArray secNotes = secObj.getAsJsonArray("sectionNotes");
+                ^
+  symbol:   class JsonArray
+  location: class ChartEditor
+./Source/ChartEditor.java:321: error: cannot find symbol
+                for (JsonElement noteEl : secNotes) {
+                     ^
+  symbol:   class JsonElement
+  location: class ChartEditor
+./Source/ChartEditor.java:323: error: cannot find symbol
+                    JsonArray arr = noteEl.getAsJsonArray();
+                    ^
+  symbol:   class JsonArray
+  location: class ChartEditor
+./Source/ChartEditor.java:331: error: cannot find symbol
+                        JsonElement sideEl = arr.get(3);
+                        ^
+  symbol:   class JsonElement
+  location: class ChartEditor
+./Source/ChartEditor.java:359: error: cannot find symbol
+            JsonObject root = new JsonObject();
+            ^
+  symbol:   class JsonObject
+  location: class ChartEditor
+./Source/ChartEditor.java:359: error: cannot find symbol
+            JsonObject root = new JsonObject();
+                                  ^
+  symbol:   class JsonObject
+  location: class ChartEditor
+./Source/ChartEditor.java:360: error: cannot find symbol
+            JsonObject song = new JsonObject();
+            ^
+  symbol:   class JsonObject
+  location: class ChartEditor
+./Source/ChartEditor.java:360: error: cannot find symbol
+            JsonObject song = new JsonObject();
+                                  ^
+  symbol:   class JsonObject
+  location: class ChartEditor
+./Source/ChartEditor.java:371: error: cannot find symbol
+            JsonArray sections = new JsonArray();
+            ^
+  symbol:   class JsonArray
+  location: class ChartEditor
+./Source/ChartEditor.java:371: error: cannot find symbol
+            JsonArray sections = new JsonArray();
+                                     ^
+  symbol:   class JsonArray
+  location: class ChartEditor
+./Source/ChartEditor.java:373: error: cannot find symbol
+                JsonObject secObj = new JsonObject();
+                ^
+  symbol:   class JsonObject
+  location: class ChartEditor
+./Source/ChartEditor.java:373: error: cannot find symbol
+                JsonObject secObj = new JsonObject();
+                                        ^
+  symbol:   class JsonObject
+  location: class ChartEditor
+./Source/ChartEditor.java:378: error: cannot find symbol
+                JsonArray secNotes = new JsonArray();
+                ^
+  symbol:   class JsonArray
+  location: class ChartEditor
+./Source/ChartEditor.java:378: error: cannot find symbol
+                JsonArray secNotes = new JsonArray();
+                                         ^
+  symbol:   class JsonArray
+  location: class ChartEditor
+./Source/ChartEditor.java:381: error: cannot find symbol
+                    JsonArray arr = new JsonArray();
+                    ^
+  symbol:   class JsonArray
+  location: class ChartEditor
+./Source/ChartEditor.java:381: error: cannot find symbol
+                    JsonArray arr = new JsonArray();
+                                        ^
+  symbol:   class JsonArray
+  location: class ChartEditor
+32 errors
+andre@HP-Laptop-15-dy2xxx:~/Music/FNF-JAVA-ENGINE$ 
+
+
+
+
+so if you get this error on compiling.. here is a fix
+run these commands
+
+1: javac -cp ".:gson-2.10.1.jar:json-20231013.jar" Main.java Source/*.java
+2: java -cp ".:gson-2.10.1.jar:json-20231013.jar" Main

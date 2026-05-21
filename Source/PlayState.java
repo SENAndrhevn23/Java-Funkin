@@ -9,36 +9,26 @@ import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
 import java.io.*;
+import java.lang.reflect.Constructor;
 import java.nio.file.*;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import Source.ChartEditor;
 
-/**
- * Refactored PlayState focused on:
- * - merged charts: song.json + song-2.json + song-3.json ...
- * - scroll speed read from JSON "speed"
- * - visible-window rendering only
- * - chunked note storage with chunk dropping after notes are behind the playhead
- *
- * Notes:
- * - This is designed to avoid O(total notes) work per frame.
- * - Truly massive charts still depend on RAM and the size of the chart file(s).
- * - For extreme charts, the next step would be a disk-backed streaming index.
- */
 public class PlayState extends JPanel implements KeyListener {
     private static final int SCREEN_W = 1280;
     private static final int SCREEN_H = 720;
-
     private static final int NPS_WINDOW_MS = 1000;
     private static final int STREAM_KEEP_BEHIND_MS = 5000;
     private static final int MISS_DRAW_PADDING = 120;
     private static final int HIT_Y = 100;
     private static final int FINAL_RENDER_PADDING_MS = 5000;
-
-    // Tune this up/down depending on your RAM and how long you keep old notes around.
-    private static final int MAX_BUFFERED_NOTES = 1_500_000;
+    private static final int MAX_BUFFERED_NOTES = 2_000_000;
     private static final int CHUNK_SIZE = 8192;
 
     private final JFrame frame;
@@ -69,7 +59,6 @@ public class PlayState extends JPanel implements KeyListener {
     private long totalNotes = 0L;
     private long bufferedNotes = 0L;
     private final Object bufferLock = new Object();
-
     private final Object laneLock = new Object();
     private final Object renderLock = new Object();
 
@@ -115,9 +104,6 @@ public class PlayState extends JPanel implements KeyListener {
     private long lastNoteTimeMs = 0L;
     private long sharedCombo = 0;
 
-    private final Font hudFont = new Font("Monospaced", Font.BOLD, 16);
-    private final Font statFont = new Font("Monospaced", Font.BOLD, 18);
-
     private static final int[] KEY_POOL = {
             KeyEvent.VK_A, KeyEvent.VK_S, KeyEvent.VK_D, KeyEvent.VK_F, KeyEvent.VK_G, KeyEvent.VK_H,
             KeyEvent.VK_J, KeyEvent.VK_K, KeyEvent.VK_L, KeyEvent.VK_Z, KeyEvent.VK_X, KeyEvent.VK_C,
@@ -131,52 +117,41 @@ public class PlayState extends JPanel implements KeyListener {
             KeyEvent.VK_CLOSE_BRACKET, KeyEvent.VK_MINUS, KeyEvent.VK_EQUALS, KeyEvent.VK_BACK_SLASH, KeyEvent.VK_BACK_QUOTE
     };
 
-    private static final class Note {
-        final double time;
-        final float sustain;
-
-        Note(double time, float sustain) {
-            this.time = time;
-            this.sustain = sustain;
-        }
-    }
-
-    /**
-     * Chunked notes per lane.
-     * Good for huge charts because we can drop whole chunks that are entirely behind the playhead.
-     */
     private static final class LaneStream {
-        private final ArrayList<double[]> timeChunks = new ArrayList<>();
-        private final ArrayList<float[]> sustainChunks = new ArrayList<>();
-        private final ArrayList<Integer> chunkSizes = new ArrayList<>();
-        private final ArrayList<Double> chunkMaxTimes = new ArrayList<>();
+        private static final class Chunk {
+            final double[] times = new double[CHUNK_SIZE];
+            final float[] sustains = new float[CHUNK_SIZE];
+            int size = 0;
+            double firstTime = Double.POSITIVE_INFINITY;
+            double lastTime = Double.NEGATIVE_INFINITY;
+        }
 
+        private final ArrayList<Chunk> chunks = new ArrayList<>();
+        private final ArrayList<Integer> chunkStarts = new ArrayList<>();
         private int totalSize = 0;
+        private int baseIndex = 0;
         private int headChunk = 0;
-        private int headIndex = 0;
         private int hitCursor = 0;
         private int npsStart = 0;
         private int npsEnd = 0;
 
         synchronized void add(double time, float sustain) {
-            if (timeChunks.isEmpty() || chunkSizes.get(chunkSizes.size() - 1) >= CHUNK_SIZE) {
-                timeChunks.add(new double[CHUNK_SIZE]);
-                sustainChunks.add(new float[CHUNK_SIZE]);
-                chunkSizes.add(0);
-                chunkMaxTimes.add(Double.NEGATIVE_INFINITY);
+            if (chunks.isEmpty() || chunks.get(chunks.size() - 1).size >= CHUNK_SIZE) {
+                chunks.add(new Chunk());
+                chunkStarts.add(totalSize);
             }
 
-            int last = timeChunks.size() - 1;
-            int idx = chunkSizes.get(last);
-            timeChunks.get(last)[idx] = time;
-            sustainChunks.get(last)[idx] = sustain;
-            chunkSizes.set(last, idx + 1);
-            chunkMaxTimes.set(last, time);
+            Chunk c = chunks.get(chunks.size() - 1);
+            int idx = c.size++;
+            c.times[idx] = time;
+            c.sustains[idx] = sustain;
+            if (time < c.firstTime) c.firstTime = time;
+            if (time > c.lastTime) c.lastTime = time;
             totalSize++;
         }
 
         synchronized int size() {
-            return totalSize;
+            return totalSize - baseIndex;
         }
 
         synchronized int hitCursor() {
@@ -192,81 +167,115 @@ public class PlayState extends JPanel implements KeyListener {
         synchronized int npsEnd() { return npsEnd; }
         synchronized void setNpsEnd(int value) { npsEnd = Math.max(0, value); }
 
-        synchronized double timeAt(int globalIndex) {
-            if (globalIndex < 0 || globalIndex >= totalSize) {
-                throw new IndexOutOfBoundsException("Index: " + globalIndex + " size: " + totalSize);
+        private int findChunkByAbsoluteIndex(int absIndex) {
+            int lo = headChunk;
+            int hi = chunks.size() - 1;
+            while (lo <= hi) {
+                int mid = (lo + hi) >>> 1;
+                int start = chunkStarts.get(mid);
+                Chunk c = chunks.get(mid);
+                int end = start + c.size;
+                if (absIndex < start) hi = mid - 1;
+                else if (absIndex >= end) lo = mid + 1;
+                else return mid;
             }
-            int idx = globalIndex;
-            for (int c = 0; c < timeChunks.size(); c++) {
-                int sz = chunkSizes.get(c);
-                if (idx < sz) return timeChunks.get(c)[idx];
-                idx -= sz;
-            }
-            throw new IndexOutOfBoundsException("Index mapping failed");
+            return -1;
         }
 
-        synchronized int lowerBound(double value) {
-            int lo = 0, hi = totalSize;
+        synchronized double timeAt(int liveIndex) {
+            int absIndex = liveIndex + baseIndex;
+            if (absIndex < baseIndex || absIndex >= totalSize) {
+                throw new IndexOutOfBoundsException("Index: " + liveIndex + " size: " + size());
+            }
+            int chunkIndex = findChunkByAbsoluteIndex(absIndex);
+            if (chunkIndex < 0) throw new IndexOutOfBoundsException("Index mapping failed");
+            int start = chunkStarts.get(chunkIndex);
+            return chunks.get(chunkIndex).times[absIndex - start];
+        }
+
+        private int localLowerBound(double[] arr, int size, double value, boolean upper) {
+            int lo = 0, hi = size;
             while (lo < hi) {
                 int mid = (lo + hi) >>> 1;
-                if (timeAt(mid) < value) lo = mid + 1;
+                double t = arr[mid];
+                if (t < value || (upper && t <= value)) lo = mid + 1;
                 else hi = mid;
             }
             return lo;
         }
 
-        synchronized int upperBound(double value) {
-            int lo = 0, hi = totalSize;
+        private int bound(double value, boolean upper) {
+            int liveSize = size();
+            if (liveSize <= 0) return 0;
+
+            int lo = headChunk;
+            int hi = chunks.size();
             while (lo < hi) {
                 int mid = (lo + hi) >>> 1;
-                if (timeAt(mid) <= value) lo = mid + 1;
+                Chunk c = chunks.get(mid);
+                if (c.lastTime < value) lo = mid + 1;
                 else hi = mid;
             }
-            return lo;
+            if (lo >= chunks.size()) return liveSize;
+
+            Chunk c = chunks.get(lo);
+            int startAbs = chunkStarts.get(lo);
+            int local = localLowerBound(c.times, c.size, value, upper);
+            return Math.max(0, (startAbs + local) - baseIndex);
         }
 
+        synchronized int lowerBound(double value) { return bound(value, false); }
+        synchronized int upperBound(double value) { return bound(value, true); }
         synchronized int countInWindow(double startInclusive, double endInclusive) {
-            int start = lowerBound(startInclusive);
-            int end = upperBound(endInclusive);
-            return Math.max(0, end - start);
+            return Math.max(0, upperBound(endInclusive) - lowerBound(startInclusive));
         }
 
         synchronized int compactBefore(double minTime) {
             int removed = 0;
-
-            while (headChunk < timeChunks.size()) {
-                int sz = chunkSizes.get(headChunk);
-                if (sz <= 0) {
-                    dropHeadChunk();
+            while (headChunk < chunks.size()) {
+                Chunk c = chunks.get(headChunk);
+                if (c.size <= 0) {
+                    headChunk++;
                     continue;
                 }
-
-                double maxTime = chunkMaxTimes.get(headChunk);
-                if (maxTime >= minTime) break;
-
-                removed += sz;
-                dropHeadChunk();
+                if (c.lastTime < minTime) {
+                    removed += c.size;
+                    headChunk++;
+                } else {
+                    break;
+                }
             }
 
-            if (removed > 0) {
-                totalSize -= removed;
-                hitCursor = Math.max(0, hitCursor - removed);
-                npsStart = Math.max(0, npsStart - removed);
-                npsEnd = Math.max(0, npsEnd - removed);
-            }
+            if (removed == 0) return 0;
 
-            if (hitCursor < 0) hitCursor = 0;
-            if (npsStart < 0) npsStart = 0;
-            if (npsEnd < 0) npsEnd = 0;
+            baseIndex = Math.min(totalSize, baseIndex + removed);
+            hitCursor = Math.max(0, hitCursor - removed);
+            npsStart = Math.max(0, npsStart - removed);
+            npsEnd = Math.max(0, npsEnd - removed);
+
+            if (headChunk > 128 && headChunk > chunks.size() / 2) {
+                rebuildAfterTrim();
+            }
             return removed;
         }
 
-        private void dropHeadChunk() {
-            timeChunks.remove(headChunk);
-            sustainChunks.remove(headChunk);
-            chunkSizes.remove(headChunk);
-            chunkMaxTimes.remove(headChunk);
-            headIndex = 0;
+        private void rebuildAfterTrim() {
+            ArrayList<Chunk> newChunks = new ArrayList<>(chunks.size() - headChunk);
+            ArrayList<Integer> newStarts = new ArrayList<>(chunks.size() - headChunk);
+            int abs = 0;
+            for (int i = headChunk; i < chunks.size(); i++) {
+                Chunk c = chunks.get(i);
+                newStarts.add(abs);
+                newChunks.add(c);
+                abs += c.size;
+            }
+            chunks.clear();
+            chunks.addAll(newChunks);
+            chunkStarts.clear();
+            chunkStarts.addAll(newStarts);
+            totalSize = abs;
+            baseIndex = 0;
+            headChunk = 0;
         }
     }
 
@@ -276,7 +285,6 @@ public class PlayState extends JPanel implements KeyListener {
         final double width;
         final double opponentX;
         final double playerX;
-
         Layout(double spacing, double noteSize, double width, double opponentX, double playerX) {
             this.spacing = spacing;
             this.noteSize = noteSize;
@@ -286,9 +294,7 @@ public class PlayState extends JPanel implements KeyListener {
         }
     }
 
-    public PlayState(String songName) {
-        this(songName, MainMenu.botPlay);
-    }
+    public PlayState(String songName) { this(songName, MainMenu.botPlay); }
 
     public PlayState(String songName, boolean botPlay) {
         this.songName = songName;
@@ -330,12 +336,20 @@ public class PlayState extends JPanel implements KeyListener {
         frame.setLocationRelativeTo(null);
         frame.setIgnoreRepaint(true);
         frame.add(this);
-        frame.setVisible(true);
-        frame.addKeyListener(this);
-        frame.setFocusable(true);
-        setFocusable(true);
         setDoubleBuffered(true);
-        SwingUtilities.invokeLater(() -> frame.requestFocusInWindow());
+
+        // Listen on the panel too, but also install a global binding so 7 always works.
+        setFocusable(true);
+        setFocusTraversalKeysEnabled(false);
+        addKeyListener(this);
+        frame.addKeyListener(this);
+
+        frame.setVisible(true);
+        installGlobalKeyBindings();
+        SwingUtilities.invokeLater(() -> {
+            requestFocusInWindow();
+            frame.requestFocusInWindow();
+        });
 
         Thread gameThread = new Thread(this::gameLoop, "PlayState-GameLoop");
         gameThread.setDaemon(true);
@@ -379,22 +393,17 @@ public class PlayState extends JPanel implements KeyListener {
         if (count == 7) return new int[]{0, 2, 3, 2, 0, 1, 3};
         if (count == 8) return new int[]{0, 1, 2, 3, 0, 1, 2, 3};
         if (count == 9) return new int[]{0, 1, 2, 3, 2, 0, 1, 2, 3};
-
         int[] dirs = new int[count];
         for (int i = 0; i < count; i++) dirs[i] = directionForLaneIndex(i);
         return dirs;
     }
 
     private void ensureLaneCount(int needed) {
-        if (needed <= laneCount) return;
-        if (!MainMenu.infiniteKeys) return;
-
+        if (needed <= laneCount || !MainMenu.infiniteKeys) return;
         synchronized (laneLock) {
             if (needed <= laneCount) return;
-
             int oldCount = laneCount;
             int newCount = Math.max(needed, laneCount * 2);
-
             playerLanes = Arrays.copyOf(playerLanes, newCount);
             opponentLanes = Arrays.copyOf(opponentLanes, newCount);
             playerHeld = Arrays.copyOf(playerHeld, newCount);
@@ -402,14 +411,12 @@ public class PlayState extends JPanel implements KeyListener {
             opponentGlow = Arrays.copyOf(opponentGlow, newCount);
             laneKeys = Arrays.copyOf(laneKeys, newCount);
             laneDirections = Arrays.copyOf(laneDirections, newCount);
-
             for (int i = oldCount; i < newCount; i++) {
                 playerLanes[i] = new LaneStream();
                 opponentLanes[i] = new LaneStream();
                 laneKeys[i] = KEY_POOL[i % KEY_POOL.length];
                 laneDirections[i] = directionForLaneIndex(i);
             }
-
             laneCount = newCount;
         }
     }
@@ -418,7 +425,6 @@ public class PlayState extends JPanel implements KeyListener {
         Files.createDirectories(Paths.get("Video"));
         String videoPath = "Video/" + songName + ".mp4";
         String audioPath = getAudioPath();
-
         ProcessBuilder pb;
         if (audioPath != null) {
             pb = new ProcessBuilder(
@@ -451,7 +457,6 @@ public class PlayState extends JPanel implements KeyListener {
                     videoPath
             );
         }
-
         pb.redirectError(ProcessBuilder.Redirect.INHERIT);
         ffmpegProcess = pb.start();
         videoOutput = ffmpegProcess.getOutputStream();
@@ -459,14 +464,14 @@ public class PlayState extends JPanel implements KeyListener {
     }
 
     private String getAudioPath() {
-        String base = "Assets/Songs/" + songName + "/";
+        Path base = Paths.get("Assets", "Songs", songName);
         String[] candidates = {
                 songName + ".mp3", "song.mp3", "Inst.mp3", "inst.mp3",
                 songName + ".ogg", "song.ogg"
         };
         for (String c : candidates) {
-            File f = new File(base + c);
-            if (f.exists()) return f.getAbsolutePath();
+            Path p = base.resolve(c);
+            if (Files.exists(p)) return p.toAbsolutePath().toString();
         }
         System.err.println("[RENDER] WARNING: No audio file found for song '" + songName + "'. Video will be silent.");
         return null;
@@ -498,9 +503,7 @@ public class PlayState extends JPanel implements KeyListener {
                 videoOutput.close();
                 videoOutput = null;
             }
-            if (ffmpegProcess != null) {
-                ffmpegProcess.waitFor();
-            }
+            if (ffmpegProcess != null) ffmpegProcess.waitFor();
         } catch (Exception ignored) {
         }
         running = false;
@@ -518,7 +521,6 @@ public class PlayState extends JPanel implements KeyListener {
         while (running) {
             long frameStart = System.nanoTime();
             updateGame();
-
             if (renderMode && offscreenImage != null) {
                 synchronized (renderLock) {
                     offscreenGraphics.setColor(Color.BLACK);
@@ -529,20 +531,12 @@ public class PlayState extends JPanel implements KeyListener {
             } else {
                 repaint();
             }
-
             Toolkit.getDefaultToolkit().sync();
-
             int targetFrameMs = renderMode ? Math.max(1, 1000 / Math.max(1, targetFPS)) : 16;
             long elapsed = (System.nanoTime() - frameStart) / 1_000_000L;
             long sleep = targetFrameMs - elapsed;
-
             if (sleep > 0) {
-                try {
-                    Thread.sleep(sleep);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
+                try { Thread.sleep(sleep); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
             } else {
                 Thread.yield();
             }
@@ -563,7 +557,6 @@ public class PlayState extends JPanel implements KeyListener {
         opponentMaxNps = 0;
         playerCurrentNps = 0;
         playerMaxNps = 0;
-
         synchronized (laneLock) {
             for (int i = 0; i < laneCount; i++) {
                 playerLanes[i] = new LaneStream();
@@ -573,7 +566,6 @@ public class PlayState extends JPanel implements KeyListener {
                 playerHeld[i] = false;
             }
         }
-
         playerCombo = 0;
         opponentCombo = 0;
         comboPopupValue = 0;
@@ -626,7 +618,6 @@ public class PlayState extends JPanel implements KeyListener {
                 LaneStream stream = opponentLanes[lane];
                 int cursor = stream.hitCursor();
                 int size = stream.size();
-
                 while (cursor < size) {
                     double noteTime = stream.timeAt(cursor);
                     if (songTime >= noteTime) {
@@ -635,11 +626,8 @@ public class PlayState extends JPanel implements KeyListener {
                         sharedCombo++;
                         triggerNumberPopup(sharedCombo);
                         cursor++;
-                    } else {
-                        break;
-                    }
+                    } else break;
                 }
-
                 stream.setHitCursor(cursor);
             }
         }
@@ -651,7 +639,6 @@ public class PlayState extends JPanel implements KeyListener {
                 LaneStream stream = playerLanes[lane];
                 int cursor = stream.hitCursor();
                 int size = stream.size();
-
                 if (botPlay || renderMode) {
                     while (cursor < size) {
                         double noteTime = stream.timeAt(cursor);
@@ -661,9 +648,7 @@ public class PlayState extends JPanel implements KeyListener {
                             sharedCombo++;
                             triggerNumberPopup(sharedCombo);
                             cursor++;
-                        } else {
-                            break;
-                        }
+                        } else break;
                     }
                 } else {
                     while (cursor < size) {
@@ -672,12 +657,9 @@ public class PlayState extends JPanel implements KeyListener {
                             playerCombo = 0;
                             sharedCombo = 0;
                             cursor++;
-                        } else {
-                            break;
-                        }
+                        } else break;
                     }
                 }
-
                 stream.setHitCursor(cursor);
             }
         }
@@ -686,14 +668,12 @@ public class PlayState extends JPanel implements KeyListener {
     private void cleanupOldNotes(long songTime) {
         double minKeepTime = songTime - STREAM_KEEP_BEHIND_MS;
         long removedTotal = 0;
-
         synchronized (laneLock) {
             for (int i = 0; i < laneCount; i++) {
                 removedTotal += playerLanes[i].compactBefore(minKeepTime);
                 removedTotal += opponentLanes[i].compactBefore(minKeepTime);
             }
         }
-
         if (removedTotal > 0) {
             synchronized (bufferLock) {
                 bufferedNotes -= removedTotal;
@@ -706,7 +686,6 @@ public class PlayState extends JPanel implements KeyListener {
     private boolean isChartDrained(long songTime) {
         if (!chartParsingFinished) return false;
         if (songTime < lastNoteTimeMs + FINAL_RENDER_PADDING_MS) return false;
-
         synchronized (laneLock) {
             for (int i = 0; i < laneCount; i++) {
                 if (playerLanes[i].hitCursor() < playerLanes[i].size()) return false;
@@ -718,20 +697,16 @@ public class PlayState extends JPanel implements KeyListener {
 
     private void updateNpsCounters(long songTime) {
         double windowStart = songTime - NPS_WINDOW_MS;
-
         int oNps = 0;
         int pNps = 0;
-
         synchronized (laneLock) {
             for (int lane = 0; lane < laneCount; lane++) {
                 oNps += opponentLanes[lane].countInWindow(windowStart, songTime);
                 pNps += playerLanes[lane].countInWindow(windowStart, songTime);
             }
         }
-
         opponentCurrentNps = oNps;
         if (opponentCurrentNps > opponentMaxNps) opponentMaxNps = opponentCurrentNps;
-
         playerCurrentNps = pNps;
         if (playerCurrentNps > playerMaxNps) playerMaxNps = playerCurrentNps;
     }
@@ -742,21 +717,10 @@ public class PlayState extends JPanel implements KeyListener {
         popupFrames = popupMaxFrames;
     }
 
-    private long getSongTime() {
-        return (long) songTimeMs;
-    }
-
-    private String formatNumber(long value) {
-        return String.format(Locale.US, "%,d", value);
-    }
-
-    private String formatMemoryMB(long mb) {
-        return mb + "MB";
-    }
-
-    private String formatMemoryGB(long mb) {
-        return String.format(Locale.US, "%.2fGB", mb / 1024.0);
-    }
+    private long getSongTime() { return (long) songTimeMs; }
+    private String formatNumber(long value) { return String.format(Locale.US, "%,d", value); }
+    private String formatMemoryMB(long mb) { return mb + "MB"; }
+    private String formatMemoryGB(long mb) { return String.format(Locale.US, "%.2fGB", mb / 1024.0); }
 
     private void loadSongJSON(String song) {
         resetChart();
@@ -768,14 +732,12 @@ public class PlayState extends JPanel implements KeyListener {
             try {
                 List<Path> chartFiles = findChartFiles(song);
                 if (chartFiles.isEmpty()) throw new FileNotFoundException("No chart JSON found for song: " + song);
-
                 for (Path chart : chartFiles) {
                     try (InputStream in = new BufferedInputStream(Files.newInputStream(chart), 1 << 20)) {
                         new ChartParser(in).parse();
                         System.out.println("[CHART] Loaded: " + chart.getFileName());
                     }
                 }
-
                 System.out.println("[CHART] Total notes loaded: " + totalNotes);
                 System.out.println("[CHART] Scroll speed: " + songSpeed);
             } catch (Exception e) {
@@ -784,9 +746,7 @@ public class PlayState extends JPanel implements KeyListener {
             } finally {
                 chartParsingFinished = true;
                 parserStarted = false;
-                synchronized (bufferLock) {
-                    bufferLock.notifyAll();
-                }
+                synchronized (bufferLock) { bufferLock.notifyAll(); }
             }
         }, "Chart-Parser");
 
@@ -794,19 +754,26 @@ public class PlayState extends JPanel implements KeyListener {
         parserThread.start();
     }
 
-    private List<Path> findChartFiles(String song) throws IOException {
-        Path dir = Paths.get("Assets", "Songs", song);
-        if (!Files.isDirectory(dir)) throw new FileNotFoundException("Song folder not found: " + dir.toAbsolutePath());
 
-        List<Path> files = new ArrayList<>();
-        Path base = dir.resolve(song + ".json");
-        Path test = dir.resolve("test.json");
+private List<Path> findChartFiles(String song) throws IOException {
+    Path dir = Paths.get("Assets", "Songs", song);
+    if (!Files.isDirectory(dir)) throw new FileNotFoundException("Song folder not found: " + dir.toAbsolutePath());
 
-        if (Files.exists(base)) files.add(base);
-        else if (Files.exists(test)) files.add(test);
+    List<Path> files = new ArrayList<>();
+    Path songBase = dir.resolve(song + ".json");
+    Path testBase = dir.resolve("test.json");
+    String prefix = null;
 
-        Pattern splitPattern = Pattern.compile(Pattern.quote(song) + "-(\\d+)\\.json", Pattern.CASE_INSENSITIVE);
+    if (Files.exists(songBase)) {
+        prefix = song;
+        files.add(songBase);
+    } else if (Files.exists(testBase)) {
+        prefix = "test";
+        files.add(testBase);
+    }
 
+    if (prefix != null) {
+        Pattern splitPattern = Pattern.compile(Pattern.quote(prefix) + "-(\\d+)\\.json", Pattern.CASE_INSENSITIVE);
         try (var stream = Files.list(dir)) {
             stream.filter(p -> Files.isRegularFile(p) && p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".json"))
                     .forEach(p -> {
@@ -815,22 +782,24 @@ public class PlayState extends JPanel implements KeyListener {
                         if (m.matches()) files.add(p);
                     });
         }
-
-        files.sort(Comparator.comparingInt(p -> chartPartIndex(p.getFileName().toString(), song)));
-        return files;
     }
+
+    files.sort(Comparator.comparingInt(p -> chartPartIndex(p.getFileName().toString(), song)));
+    return files;
+}
 
     private int chartPartIndex(String fileName, String song) {
         if (fileName.equalsIgnoreCase(song + ".json")) return 0;
         if (fileName.equalsIgnoreCase("test.json")) return 0;
-
-        Pattern splitPattern = Pattern.compile(Pattern.quote(song) + "-(\\d+)\\.json", Pattern.CASE_INSENSITIVE);
-        Matcher m = splitPattern.matcher(fileName);
-        if (m.matches()) {
-            try {
-                return Integer.parseInt(m.group(1));
-            } catch (NumberFormatException ignored) {
-            }
+        Pattern splitPatternSong = Pattern.compile(Pattern.quote(song) + "-(\\d+)\\.json", Pattern.CASE_INSENSITIVE);
+        Matcher songMatch = splitPatternSong.matcher(fileName);
+        if (songMatch.matches()) {
+            try { return Integer.parseInt(songMatch.group(1)); } catch (NumberFormatException ignored) { }
+        }
+        Pattern splitPatternTest = Pattern.compile(Pattern.quote("test") + "-(\\d+)\\.json", Pattern.CASE_INSENSITIVE);
+        Matcher testMatch = splitPatternTest.matcher(fileName);
+        if (testMatch.matches()) {
+            try { return Integer.parseInt(testMatch.group(1)); } catch (NumberFormatException ignored) { }
         }
         return Integer.MAX_VALUE;
     }
@@ -842,9 +811,7 @@ public class PlayState extends JPanel implements KeyListener {
         private int limit = 0;
         private int peeked = Integer.MIN_VALUE;
 
-        ChartParser(InputStream in) {
-            this.in = in;
-        }
+        ChartParser(InputStream in) { this.in = in; }
 
         void parse() throws IOException {
             skipWs();
@@ -960,7 +927,6 @@ public class PlayState extends JPanel implements KeyListener {
             skipWs();
             int c = peek();
             if (c < 0) throw new IOException("Expected number");
-
             boolean negative = false;
             if (c == '-') {
                 negative = true;
@@ -996,14 +962,8 @@ public class PlayState extends JPanel implements KeyListener {
                 read();
                 c = peek();
                 int expSign = 1;
-                if (c == '-') {
-                    expSign = -1;
-                    read();
-                    c = peek();
-                } else if (c == '+') {
-                    read();
-                    c = peek();
-                }
+                if (c == '-') { expSign = -1; read(); c = peek(); }
+                else if (c == '+') { read(); c = peek(); }
                 int exponent = 0;
                 while (c >= '0' && c <= '9') {
                     exponent = exponent * 10 + (c - '0');
@@ -1019,20 +979,12 @@ public class PlayState extends JPanel implements KeyListener {
         private boolean readBoolean() throws IOException {
             skipWs();
             int c = peek();
-            if (c == 't') {
-                readLiteral("true");
-                return true;
-            }
-            if (c == 'f') {
-                readLiteral("false");
-                return false;
-            }
+            if (c == 't') { readLiteral("true"); return true; }
+            if (c == 'f') { readLiteral("false"); return false; }
             throw new IOException("Expected boolean");
         }
 
-        private void readNull() throws IOException {
-            readLiteral("null");
-        }
+        private void readNull() throws IOException { readLiteral("null"); }
 
         private void skipValue() throws IOException {
             skipWs();
@@ -1072,32 +1024,14 @@ public class PlayState extends JPanel implements KeyListener {
             expect('{');
             skipWs();
             boolean localMustHit = true;
-
-            if (peek() == '}') {
-                read();
-                return;
-            }
-
+            if (peek() == '}') { read(); return; }
             while (true) {
                 skipWs();
-                if (peek() == '}') {
-                    read();
-                    return;
-                }
-
+                if (peek() == '}') { read(); return; }
                 String key = readString();
                 skipWs();
-
-                if (peek() == ':') {
-                    read();
-                } else {
-                    recoverToNextObjectToken();
-                    continue;
-                }
-
+                if (peek() == ':') read(); else { recoverToNextObjectToken(); continue; }
                 skipWs();
-
-                // Support common chart metadata.
                 if ("speed".equals(key)) {
                     songSpeed = readNumber();
                 } else if ("mustHitSection".equals(key)) {
@@ -1107,17 +1041,10 @@ public class PlayState extends JPanel implements KeyListener {
                 } else {
                     skipValue();
                 }
-
                 skipWs();
                 int c = peek();
-                if (c == ',') {
-                    read();
-                    continue;
-                }
-                if (c == '}') {
-                    read();
-                    return;
-                }
+                if (c == ',') { read(); continue; }
+                if (c == '}') { read(); return; }
                 if (c < 0) return;
                 recoverToNextObjectToken();
             }
@@ -1126,8 +1053,7 @@ public class PlayState extends JPanel implements KeyListener {
         private void recoverToNextObjectToken() throws IOException {
             while (true) {
                 int c = peek();
-                if (c < 0) return;
-                if (c == ',' || c == '}') return;
+                if (c < 0 || c == ',' || c == '}') return;
                 read();
             }
         }
@@ -1135,22 +1061,13 @@ public class PlayState extends JPanel implements KeyListener {
         private void parseArray() throws IOException {
             expect('[');
             skipWs();
-            if (peek() == ']') {
-                read();
-                return;
-            }
+            if (peek() == ']') { read(); return; }
             while (true) {
                 parseValue();
                 skipWs();
                 int c = peek();
-                if (c == ',') {
-                    read();
-                    continue;
-                }
-                if (c == ']') {
-                    read();
-                    return;
-                }
+                if (c == ',') { read(); continue; }
+                if (c == ']') { read(); return; }
                 if (c < 0) return;
                 while (true) {
                     c = peek();
@@ -1163,27 +1080,15 @@ public class PlayState extends JPanel implements KeyListener {
         private void parseSectionNotes(boolean sectionMustHit) throws IOException {
             expect('[');
             skipWs();
-            if (peek() == ']') {
-                read();
-                return;
-            }
+            if (peek() == ']') { read(); return; }
             while (true) {
                 skipWs();
-                if (peek() == ']') {
-                    read();
-                    return;
-                }
+                if (peek() == ']') { read(); return; }
                 parseNoteEntry(sectionMustHit);
                 skipWs();
                 int c = peek();
-                if (c == ',') {
-                    read();
-                    continue;
-                }
-                if (c == ']') {
-                    read();
-                    return;
-                }
+                if (c == ',') { read(); continue; }
+                if (c == ']') { read(); return; }
                 if (c < 0) return;
                 read();
             }
@@ -1193,11 +1098,9 @@ public class PlayState extends JPanel implements KeyListener {
             skipWs();
             if (peek() == ']') return;
             expect('[');
-
             double time = 0;
             int rawLane = 0;
             double sustain = 0;
-
             try {
                 skipWs();
                 if (peek() != ']') time = readNumber();
@@ -1217,12 +1120,9 @@ public class PlayState extends JPanel implements KeyListener {
                 skipToEndOfArray();
                 return;
             }
-
             skipToEndOfArray();
-
             if (rawLane < 0) rawLane = 0;
             if (MainMenu.infiniteKeys) ensureLaneCount(rawLane + 1);
-
             int lane;
             synchronized (laneLock) {
                 lane = laneCount == 0 ? 0 : Math.floorMod(rawLane, laneCount);
@@ -1251,9 +1151,8 @@ public class PlayState extends JPanel implements KeyListener {
 
     private void addNote(double time, int lane, boolean mustHit, double sustain) {
         if (lane < 0) lane = 0;
-        if (MainMenu.infiniteKeys) {
-            ensureLaneCount(lane + 1);
-        } else {
+        if (MainMenu.infiniteKeys) ensureLaneCount(lane + 1);
+        else {
             synchronized (laneLock) {
                 if (lane >= laneCount) lane = Math.floorMod(lane, laneCount);
             }
@@ -1263,19 +1162,12 @@ public class PlayState extends JPanel implements KeyListener {
 
         synchronized (bufferLock) {
             while (bufferedNotes >= MAX_BUFFERED_NOTES && running) {
-                try {
-                    bufferLock.wait(5);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
+                try { bufferLock.wait(5); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
             }
-
             synchronized (laneLock) {
                 if (mustHit) playerLanes[lane].add(time, (float) sustain);
                 else opponentLanes[lane].add(time, (float) sustain);
             }
-
             bufferedNotes++;
             totalNotes++;
             bufferLock.notifyAll();
@@ -1289,20 +1181,18 @@ public class PlayState extends JPanel implements KeyListener {
     }
 
     private void drawStatBox(Graphics2D g2, int x, int y, String text, float alpha) {
+        Font statFont = new Font("Monospaced", Font.BOLD, 18);
         g2.setFont(statFont);
         FontMetrics fm = g2.getFontMetrics(statFont);
         int paddingX = 14;
         int paddingY = 10;
-        int textW = fm.stringWidth(text);
-        int boxW = textW + (paddingX * 2);
+        int boxW = fm.stringWidth(text) + (paddingX * 2);
         int boxH = fm.getHeight() + (paddingY * 2);
-
         Composite old = g2.getComposite();
         g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
         g2.setColor(Color.BLACK);
         g2.fillRoundRect(x, y, boxW, boxH, 14, 14);
         g2.setComposite(old);
-
         g2.setColor(Color.WHITE);
         g2.setStroke(new BasicStroke(2f));
         g2.drawRoundRect(x, y, boxW, boxH, 14, 14);
@@ -1310,6 +1200,7 @@ public class PlayState extends JPanel implements KeyListener {
     }
 
     private void drawStatBoxRight(Graphics2D g2, int rightX, int y, String text, float alpha) {
+        Font statFont = new Font("Monospaced", Font.BOLD, 18);
         g2.setFont(statFont);
         FontMetrics fm = g2.getFontMetrics(statFont);
         int paddingX = 14;
@@ -1329,20 +1220,16 @@ public class PlayState extends JPanel implements KeyListener {
     private void drawNumberPopup(Graphics2D g2) {
         if (!MainMenu.numberPopups || popupFrames <= 0) return;
         String text = MainMenu.commaOnThirdDigits ? formatNumber(comboPopupValue) : Long.toString(comboPopupValue);
-
         int digitW = 54;
         int digitH = 72;
         int commaW = 26;
         int totalW = 0;
         for (int i = 0; i < text.length(); i++) totalW += (text.charAt(i) == ',') ? commaW : digitW;
-
         int x = (SCREEN_W - totalW) / 2;
         int y = 290 - ((popupMaxFrames - popupFrames) * 2);
         float alpha = Math.max(0f, Math.min(1f, popupFrames / (float) popupMaxFrames));
-
         Composite old = g2.getComposite();
         g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
-
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
             if (c == ',') {
@@ -1356,7 +1243,6 @@ public class PlayState extends JPanel implements KeyListener {
                 x += digitW;
             }
         }
-
         g2.setComposite(old);
     }
 
@@ -1378,10 +1264,6 @@ public class PlayState extends JPanel implements KeyListener {
         g2.drawImage(img, at, null);
     }
 
-    /**
-     * Visible-window-only note drawing.
-     * Only notes that can appear on screen are touched.
-     */
     private void drawLaneNotes(Graphics2D g2, boolean isPlayer, double baseX, long songTime, double finalSpeed, Layout layout) {
         LaneStream[] laneArr;
         int[] dirs;
@@ -1400,7 +1282,6 @@ public class PlayState extends JPanel implements KeyListener {
             LaneStream stream = laneArr[lane];
             int start = Math.max(stream.hitCursor(), stream.lowerBound(visibleTopTime));
             int end = stream.lowerBound(visibleBottomTime);
-
             for (int j = start; j < end; j++) {
                 double noteTime = stream.timeAt(j);
                 double y = HIT_Y + (noteTime - songTime) * finalSpeed;
@@ -1420,13 +1301,10 @@ public class PlayState extends JPanel implements KeyListener {
             dirs = laneDirections;
             held = playerHeld;
         }
-
         for (int i = 0; i < count; i++) {
             double x = baseX + (i * layout.spacing);
             int dir = dirs[i];
-
             drawImageScaled(g2, getStatic(dir), x, HIT_Y, layout.noteSize, layout.noteSize);
-
             if (glow[i] > 0) {
                 drawImageScaled(g2, getGlow(dir), x, HIT_Y, layout.noteSize, layout.noteSize);
             } else if (isPlayer && held[i]) {
@@ -1446,18 +1324,14 @@ public class PlayState extends JPanel implements KeyListener {
 
     private boolean tryHit(int lane) {
         if (lane < 0) return false;
-
         synchronized (laneLock) {
             if (lane >= laneCount) return false;
-
             LaneStream stream = playerLanes[lane];
             int cursor = stream.hitCursor();
             int size = stream.size();
             if (cursor >= size) return false;
-
             double noteTime = stream.timeAt(cursor);
             long time = getSongTime();
-
             if (Math.abs(time - noteTime) <= hitWindowMs) {
                 playerGlow[lane] = flashFrames;
                 playerCombo++;
@@ -1471,17 +1345,14 @@ public class PlayState extends JPanel implements KeyListener {
     }
 
     private void drawScene(Graphics2D g2) {
-        if (stageBG != null) {
-            g2.drawImage(stageBG, 0, 0, SCREEN_W, SCREEN_H, null);
-        } else {
+        if (stageBG != null) g2.drawImage(stageBG, 0, 0, SCREEN_W, SCREEN_H, null);
+        else {
             g2.setColor(Color.BLACK);
             g2.fillRect(0, 0, SCREEN_W, SCREEN_H);
         }
-
         Layout layout = computeLayout();
         long songTime = getSongTime();
         double finalSpeed = baseScrollSpeed * songSpeed;
-
         drawStrumLine(g2, layout.opponentX, opponentGlow, false, layout);
         drawStrumLine(g2, layout.playerX, playerGlow, true, layout);
         drawLaneNotes(g2, false, layout.opponentX, songTime, finalSpeed, layout);
@@ -1496,19 +1367,46 @@ public class PlayState extends JPanel implements KeyListener {
         Graphics2D g2 = (Graphics2D) g;
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
         g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-
         if (renderMode && offscreenImage != null) {
-            synchronized (renderLock) {
-                g2.drawImage(offscreenImage, 0, 0, null);
-            }
+            synchronized (renderLock) { g2.drawImage(offscreenImage, 0, 0, null); }
         } else {
             drawScene(g2);
         }
         g2.dispose();
     }
 
+    private void installGlobalKeyBindings() {
+        JRootPane root = frame.getRootPane();
+        InputMap inputMap = root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW);
+        ActionMap actionMap = root.getActionMap();
+
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_7, 0), "openChartEditor");
+        actionMap.put("openChartEditor", new AbstractAction() {
+            @Override
+            public void actionPerformed(java.awt.event.ActionEvent e) {
+                openChartEditor();
+            }
+        });
+
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "backToMenu");
+        inputMap.put(KeyStroke.getKeyStroke(KeyEvent.VK_BACK_SPACE, 0), "backToMenu");
+        actionMap.put("backToMenu", new AbstractAction() {
+            @Override
+            public void actionPerformed(java.awt.event.ActionEvent e) {
+                running = false;
+                if (frame != null) frame.dispose();
+                SwingUtilities.invokeLater(MainMenu::new);
+            }
+        });
+    }
+
     @Override
     public void keyPressed(KeyEvent e) {
+        if (e.getKeyCode() == KeyEvent.VK_7) {
+            openChartEditor();
+            return;
+        }
+
         int lane = laneFromKey(e.getKeyCode());
         if (lane >= 0) {
             synchronized (laneLock) {
@@ -1527,6 +1425,20 @@ public class PlayState extends JPanel implements KeyListener {
         }
     }
 
+private void openChartEditor() {
+    System.out.println("[PlayState] Opening ChartEditor");
+
+    running = false;
+
+    if (frame != null)
+        frame.dispose();
+
+    // Direct launch — NO reflection
+    SwingUtilities.invokeLater(() ->
+        new ChartEditor(songName, botPlay)
+    );
+}
+
     @Override
     public void keyReleased(KeyEvent e) {
         int lane = laneFromKey(e.getKeyCode());
@@ -1537,41 +1449,57 @@ public class PlayState extends JPanel implements KeyListener {
         }
     }
 
-    @Override
-    public void keyTyped(KeyEvent e) {
-    }
+    @Override public void keyTyped(KeyEvent e) { }
 
     private void loadImages() {
         try {
-            stageBG = ImageIO.read(new File("/home/andre/FNF-JAVA-ENGINE/Assets/Images/Stage.jpg"));
-            leftArrow = ImageIO.read(new File("Notes/LeftArrow.png"));
-            downArrow = ImageIO.read(new File("Notes/DownArrow.png"));
-            upArrow = ImageIO.read(new File("Notes/UpArrow.png"));
-            rightArrow = ImageIO.read(new File("Notes/RightArrow.png"));
+            stageBG = readImageAny(
+                    "/home/andre/FNF-JAVA-ENGINE/Assets/Images/Stage.jpg",
+                    "Assets/Images/Stage.jpg"
+            );
 
-            leftComing = ImageIO.read(new File("Notes/LeftComing.png"));
-            downComing = ImageIO.read(new File("Notes/DownComing.png"));
-            upComing = ImageIO.read(new File("Notes/UpComing.png"));
-            rightComing = ImageIO.read(new File("Notes/RightComing.png"));
+            leftArrow = readImageAny("Notes/LeftArrow.png");
+            downArrow = readImageAny("Notes/DownArrow.png");
+            upArrow = readImageAny("Notes/UpArrow.png");
+            rightArrow = readImageAny("Notes/RightArrow.png");
 
-            leftPress = ImageIO.read(new File("Notes/LeftPress.png"));
-            downPress = ImageIO.read(new File("Notes/DownPress.png"));
-            upPress = ImageIO.read(new File("Notes/UpPress.png"));
-            rightPress = ImageIO.read(new File("Notes/RightPress.png"));
+            leftComing = readImageAny("Notes/LeftComing.png");
+            downComing = readImageAny("Notes/DownComing.png");
+            upComing = readImageAny("Notes/UpComing.png");
+            rightComing = readImageAny("Notes/RightComing.png");
 
-            leftGlow = ImageIO.read(new File("Notes/LeftGlow.png"));
-            downGlow = ImageIO.read(new File("Notes/DownGlow.png"));
-            upGlow = ImageIO.read(new File("Notes/UpGlow.png"));
-            rightGlow = ImageIO.read(new File("Notes/RightGlow.png"));
+            leftPress = readImageAny("Notes/LeftPress.png");
+            downPress = readImageAny("Notes/DownPress.png");
+            upPress = readImageAny("Notes/UpPress.png");
+            rightPress = readImageAny("Notes/RightPress.png");
+
+            leftGlow = readImageAny("Notes/LeftGlow.png");
+            downGlow = readImageAny("Notes/DownGlow.png");
+            upGlow = readImageAny("Notes/UpGlow.png");
+            rightGlow = readImageAny("Notes/RightGlow.png");
 
             for (int i = 0; i < 10; i++) {
-                numberDigits[i] = ImageIO.read(new File("/home/andre/FNF-JAVA-ENGINE/Assets/Numbers/num" + i + ".png"));
+                numberDigits[i] = readImageAny(
+                        "/home/andre/FNF-JAVA-ENGINE/Assets/Numbers/num" + i + ".png",
+                        "Assets/Numbers/num" + i + ".png"
+                );
             }
-            numberComma = ImageIO.read(new File("/home/andre/FNF-JAVA-ENGINE/Assets/Numbers/numComma.png"));
+            numberComma = readImageAny(
+                    "/home/andre/FNF-JAVA-ENGINE/Assets/Numbers/numComma.png",
+                    "Assets/Numbers/numComma.png"
+            );
         } catch (Exception e) {
             System.err.println("IMAGE FOLDER ERROR.");
             e.printStackTrace();
         }
+    }
+
+    private BufferedImage readImageAny(String... paths) throws IOException {
+        for (String p : paths) {
+            File f = new File(p);
+            if (f.exists()) return ImageIO.read(f);
+        }
+        return null;
     }
 
     private BufferedImage getStatic(int dir) {
