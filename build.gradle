@@ -1,5 +1,6 @@
 plugins {
     id 'java'
+    id 'application'
 }
 
 group = 'fnfjava'
@@ -16,12 +17,20 @@ dependencies {
     )
 }
 
+application {
+    mainClass = 'Main'
+}
+
 sourceSets {
     main {
         java {
             srcDirs = ['.', 'Source']
         }
     }
+}
+
+tasks.withType(JavaExec).configureEach {
+    workingDir = projectDir
 }
 
 jar {
