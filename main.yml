@@ -22,7 +22,7 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # 3. Install FFmpeg (needed for rendering mode)
+      # 3. Install FFmpeg
       - name: Install FFmpeg
         run: |
           sudo apt update
@@ -37,14 +37,20 @@ jobs:
             Source/**/*.java \
             Source/*.java
 
-      # 5. Package into runnable JAR
+      # 5. Build runnable JAR
       - name: Build JAR
         run: |
-          jar --create --file Java-Funkin.jar -C out .
+          jar --create --file FNF-JAVA-ENGINE.jar -C out .
 
-      # 6. Upload build artifact
+      # 6. Create portable release folder
+      - name: Prepare release package
+        run: |
+          mkdir -p Release/Mods/Songs
+          cp FNF-JAVA-ENGINE.jar Release/
+
+      # 7. Upload build artifact
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: Java-Funkin
-          path: Java-Funkin.jar
+          name: FNF-JAVA-ENGINE
+          path: Release/
