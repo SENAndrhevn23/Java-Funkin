@@ -1,6 +1,6 @@
-# 🎮 FNF JAVA ENGINE
+# 🎮 Java Funkin
 
-Welcome to **FNF JAVA ENGINE**.
+Welcome to **Java Funkin**.
 
 This project originally started as a personal engine just for me, but since it’s now open source, you’re free to explore, modify, and go wild with it!
 
