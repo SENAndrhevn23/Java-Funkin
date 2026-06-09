@@ -1,4 +1,4 @@
-name: Build FNF JAVA ENGINE
+name: Build Java Funkin
 
 on:
   push:
@@ -40,11 +40,11 @@ jobs:
       # 5. Package into runnable JAR
       - name: Build JAR
         run: |
-          jar --create --file FNF-JAVA-ENGINE.jar -C out .
+          jar --create --file Java-Funkin.jar -C out .
 
       # 6. Upload build artifact
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: FNF-JAVA-ENGINE
-          path: FNF-JAVA-ENGINE.jar
+          name: Java-Funkin
+          path: Java-Funkin.jar
