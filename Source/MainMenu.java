@@ -25,6 +25,8 @@ public class MainMenu extends JPanel implements KeyListener, Runnable {
     public static boolean removeOverlappedNotes = false;
     public static double overlapThresholdMs = 10.0;
     public static int maxNotesShown = 0;
+    public static boolean batchedRenderer = true;
+    public static boolean universalParser = true;
 
     private static final int[] KEY_PRESETS = {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
@@ -51,7 +53,9 @@ public class MainMenu extends JPanel implements KeyListener, Runnable {
             "Remove Overlapped Notes",
             "Overlapped Threshold (ms)",
             "Max Notes Shown",
-            "Game Rendering (FFMPEG)"
+            "Game Rendering (FFMPEG)",
+            "Batched Note Renderer",
+            "Universal Chart Parser"
     };
     private final String[] extraKeysMenu = {
             "Key Count",
@@ -284,6 +288,10 @@ public class MainMenu extends JPanel implements KeyListener, Runnable {
                     text = "Max Notes Shown: " + (maxNotesShown == 0 ? "INF" : String.valueOf(maxNotesShown));
                 } else if (i == 5) {
                     text = "Game Rendering (FFMPEG): " + (renderMode ? "ON" : "OFF");
+                } else if (i == 6) {
+                    text = "Batched Note Renderer: " + (batchedRenderer ? "ON" : "OFF");
+                } else if (i == 7) {
+                    text = "Universal Chart Parser: " + (universalParser ? "ON" : "OFF");
                 }
             } else if (state.equals("CONTROLS")) {
                 text = bindLabels[i] + ": " + KeyEvent.getKeyText(bindCodes[i]);
@@ -414,6 +422,10 @@ public class MainMenu extends JPanel implements KeyListener, Runnable {
                         removeOverlappedNotes = !removeOverlappedNotes;
                     } else if (selected == 5) {
                         renderMode = !renderMode;
+                    } else if (selected == 6) {
+                        batchedRenderer = !batchedRenderer;
+                    } else if (selected == 7) {
+                        universalParser = !universalParser;
                     }
                 }
                 case "CONTROLS" -> {

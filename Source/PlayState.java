@@ -733,9 +733,26 @@ public class PlayState extends JPanel implements KeyListener {
                 List<Path> chartFiles = findChartFiles(song);
                 if (chartFiles.isEmpty()) throw new FileNotFoundException("No chart JSON found for song: " + song);
                 for (Path chart : chartFiles) {
-                    try (InputStream in = new BufferedInputStream(Files.newInputStream(chart), 1 << 20)) {
-                        new ChartParser(in).parse();
-                        System.out.println("[CHART] Loaded: " + chart.getFileName());
+                    if (MainMenu.universalParser) {
+                        ChartParserUniversal.ChartMeta meta = ChartParserUniversal.parseFile(chart, (time, lane, sustain, mustHit) -> {
+                            addNote(time, lane, mustHit, sustain);
+                        });
+                        songSpeed = meta.speed;
+                        System.out.println("[CHART] Loaded (Universal): " + chart.getFileName() + " (bpm " + meta.bpm + ")");
+                    } else {
+                        // Fallback to old simple parser
+                        try (InputStream in = new BufferedInputStream(Files.newInputStream(chart), 1 << 20)) {
+                            String json = new String(in.readAllBytes());
+                            // Simple parse - only basic Psych format
+                            if (json.contains("sectionNotes")) {
+                                int idx = json.indexOf("sectionNotes");
+                                // Very basic fallback - just load via universal anyway for safety
+                                ChartParserUniversal.ChartMeta meta = ChartParserUniversal.parseFile(chart, (time, lane, sustain, mustHit) -> {
+                                    addNote(time, lane, mustHit, sustain);
+                                });
+                                songSpeed = meta.speed;
+                            }
+                        }
                     }
                 }
                 System.out.println("[CHART] Total notes loaded: " + totalNotes);
@@ -804,350 +821,6 @@ private List<Path> findChartFiles(String song) throws IOException {
         return Integer.MAX_VALUE;
     }
 
-    private final class ChartParser {
-        private final InputStream in;
-        private final byte[] buffer = new byte[1 << 16];
-        private int pos = 0;
-        private int limit = 0;
-        private int peeked = Integer.MIN_VALUE;
-
-        ChartParser(InputStream in) { this.in = in; }
-
-        void parse() throws IOException {
-            skipWs();
-            parseValue();
-            skipWs();
-        }
-
-        private int read() throws IOException {
-            if (peeked != Integer.MIN_VALUE) {
-                int c = peeked;
-                peeked = Integer.MIN_VALUE;
-                return c;
-            }
-            if (pos >= limit) {
-                limit = in.read(buffer);
-                pos = 0;
-                if (limit < 0) return -1;
-            }
-            return buffer[pos++] & 0xFF;
-        }
-
-        private int peek() throws IOException {
-            if (peeked == Integer.MIN_VALUE) peeked = read();
-            return peeked;
-        }
-
-        private void skipWs() throws IOException {
-            while (true) {
-                int c = peek();
-                if (c < 0 || c > 32) return;
-                read();
-            }
-        }
-
-        private void expect(char expected) throws IOException {
-            int c = read();
-            if (c != expected) throw new IOException("Expected '" + expected + "' but found '" + (char) c + "'");
-        }
-
-        private void readLiteral(String literal) throws IOException {
-            for (int i = 0; i < literal.length(); i++) {
-                int c = read();
-                if (c != literal.charAt(i)) throw new IOException("Expected literal: " + literal);
-            }
-        }
-
-        private String readString() throws IOException {
-            expect('"');
-            StringBuilder sb = new StringBuilder(64);
-            while (true) {
-                int c = read();
-                if (c < 0) throw new IOException("Unexpected EOF inside string");
-                char ch = (char) c;
-                if (ch == '"') break;
-                if (ch == '\\') {
-                    int esc = read();
-                    if (esc < 0) throw new IOException("Unexpected EOF in escape sequence");
-                    switch (esc) {
-                        case '"' -> sb.append('"');
-                        case '\\' -> sb.append('\\');
-                        case '/' -> sb.append('/');
-                        case 'b' -> sb.append('\b');
-                        case 'f' -> sb.append('\f');
-                        case 'n' -> sb.append('\n');
-                        case 'r' -> sb.append('\r');
-                        case 't' -> sb.append('\t');
-                        case 'u' -> sb.append(readUnicodeEscape());
-                        default -> sb.append((char) esc);
-                    }
-                } else {
-                    sb.append(ch);
-                }
-            }
-            return sb.toString();
-        }
-
-        private void skipString() throws IOException {
-            expect('"');
-            while (true) {
-                int c = read();
-                if (c < 0) throw new IOException("Unexpected EOF inside string");
-                char ch = (char) c;
-                if (ch == '"') return;
-                if (ch == '\\') {
-                    int esc = read();
-                    if (esc < 0) throw new IOException("Unexpected EOF in escape sequence");
-                    if (esc == 'u') {
-                        for (int i = 0; i < 4; i++) {
-                            if (read() < 0) throw new IOException("Unexpected EOF in unicode escape");
-                        }
-                    }
-                }
-            }
-        }
-
-        private char readUnicodeEscape() throws IOException {
-            int value = 0;
-            for (int i = 0; i < 4; i++) {
-                int c = read();
-                if (c < 0) throw new IOException("Unexpected EOF in unicode escape");
-                int digit = Character.digit((char) c, 16);
-                if (digit < 0) throw new IOException("Bad unicode escape");
-                value = (value << 4) | digit;
-            }
-            return (char) value;
-        }
-
-        private boolean isNumberChar(char c) {
-            return Character.isDigit(c) || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E';
-        }
-
-        private double readNumber() throws IOException {
-            skipWs();
-            int c = peek();
-            if (c < 0) throw new IOException("Expected number");
-            boolean negative = false;
-            if (c == '-') {
-                negative = true;
-                read();
-                c = peek();
-            } else if (c == '+') {
-                read();
-                c = peek();
-            }
-
-            double result = 0.0;
-            while (c >= '0' && c <= '9') {
-                result = result * 10.0 + (c - '0');
-                read();
-                c = peek();
-            }
-
-            if (c == '.') {
-                read();
-                c = peek();
-                double fraction = 0.0;
-                double divisor = 10.0;
-                while (c >= '0' && c <= '9') {
-                    fraction += (c - '0') / divisor;
-                    divisor *= 10.0;
-                    read();
-                    c = peek();
-                }
-                result += fraction;
-            }
-
-            if (c == 'e' || c == 'E') {
-                read();
-                c = peek();
-                int expSign = 1;
-                if (c == '-') { expSign = -1; read(); c = peek(); }
-                else if (c == '+') { read(); c = peek(); }
-                int exponent = 0;
-                while (c >= '0' && c <= '9') {
-                    exponent = exponent * 10 + (c - '0');
-                    read();
-                    c = peek();
-                }
-                if (exponent > 0) result *= Math.pow(10.0, expSign * exponent);
-            }
-
-            return negative ? -result : result;
-        }
-
-        private boolean readBoolean() throws IOException {
-            skipWs();
-            int c = peek();
-            if (c == 't') { readLiteral("true"); return true; }
-            if (c == 'f') { readLiteral("false"); return false; }
-            throw new IOException("Expected boolean");
-        }
-
-        private void readNull() throws IOException { readLiteral("null"); }
-
-        private void skipValue() throws IOException {
-            skipWs();
-            int c = peek();
-            if (c < 0) return;
-            switch (c) {
-                case '{' -> parseObject();
-                case '[' -> parseArray();
-                case '"' -> skipString();
-                case 't', 'f' -> readBoolean();
-                case 'n' -> readNull();
-                default -> {
-                    if (isNumberChar((char) c)) readNumber();
-                    else read();
-                }
-            }
-        }
-
-        private void parseValue() throws IOException {
-            skipWs();
-            int c = peek();
-            if (c < 0) return;
-            switch (c) {
-                case '{' -> parseObject();
-                case '[' -> parseArray();
-                case '"' -> readString();
-                case 't', 'f' -> readBoolean();
-                case 'n' -> readNull();
-                default -> {
-                    if (isNumberChar((char) c)) readNumber();
-                    else read();
-                }
-            }
-        }
-
-        private void parseObject() throws IOException {
-            expect('{');
-            skipWs();
-            boolean localMustHit = true;
-            if (peek() == '}') { read(); return; }
-            while (true) {
-                skipWs();
-                if (peek() == '}') { read(); return; }
-                String key = readString();
-                skipWs();
-                if (peek() == ':') read(); else { recoverToNextObjectToken(); continue; }
-                skipWs();
-                if ("speed".equals(key)) {
-                    songSpeed = readNumber();
-                } else if ("mustHitSection".equals(key)) {
-                    localMustHit = readBoolean();
-                } else if ("sectionNotes".equals(key)) {
-                    parseSectionNotes(localMustHit);
-                } else {
-                    skipValue();
-                }
-                skipWs();
-                int c = peek();
-                if (c == ',') { read(); continue; }
-                if (c == '}') { read(); return; }
-                if (c < 0) return;
-                recoverToNextObjectToken();
-            }
-        }
-
-        private void recoverToNextObjectToken() throws IOException {
-            while (true) {
-                int c = peek();
-                if (c < 0 || c == ',' || c == '}') return;
-                read();
-            }
-        }
-
-        private void parseArray() throws IOException {
-            expect('[');
-            skipWs();
-            if (peek() == ']') { read(); return; }
-            while (true) {
-                parseValue();
-                skipWs();
-                int c = peek();
-                if (c == ',') { read(); continue; }
-                if (c == ']') { read(); return; }
-                if (c < 0) return;
-                while (true) {
-                    c = peek();
-                    if (c < 0 || c == ',' || c == ']') break;
-                    read();
-                }
-            }
-        }
-
-        private void parseSectionNotes(boolean sectionMustHit) throws IOException {
-            expect('[');
-            skipWs();
-            if (peek() == ']') { read(); return; }
-            while (true) {
-                skipWs();
-                if (peek() == ']') { read(); return; }
-                parseNoteEntry(sectionMustHit);
-                skipWs();
-                int c = peek();
-                if (c == ',') { read(); continue; }
-                if (c == ']') { read(); return; }
-                if (c < 0) return;
-                read();
-            }
-        }
-
-        private void parseNoteEntry(boolean sectionMustHit) throws IOException {
-            skipWs();
-            if (peek() == ']') return;
-            expect('[');
-            double time = 0;
-            int rawLane = 0;
-            double sustain = 0;
-            try {
-                skipWs();
-                if (peek() != ']') time = readNumber();
-                skipWs();
-                if (peek() == ',') {
-                    read();
-                    skipWs();
-                    if (peek() != ']') rawLane = (int) Math.round(readNumber());
-                }
-                skipWs();
-                if (peek() == ',') {
-                    read();
-                    skipWs();
-                    if (peek() != ']') sustain = readNumber();
-                }
-            } catch (Exception ignored) {
-                skipToEndOfArray();
-                return;
-            }
-            skipToEndOfArray();
-            if (rawLane < 0) rawLane = 0;
-            if (MainMenu.infiniteKeys) ensureLaneCount(rawLane + 1);
-            int lane;
-            synchronized (laneLock) {
-                lane = laneCount == 0 ? 0 : Math.floorMod(rawLane, laneCount);
-            }
-            addNote(time, lane, sectionMustHit, sustain);
-        }
-
-        private void skipToEndOfArray() throws IOException {
-            int depth = 1;
-            boolean inString = false;
-            while (depth > 0) {
-                int c = read();
-                if (c < 0) return;
-                char ch = (char) c;
-                if (inString) {
-                    if (ch == '\\') read();
-                    else if (ch == '"') inString = false;
-                    continue;
-                }
-                if (ch == '"') inString = true;
-                else if (ch == '[') depth++;
-                else if (ch == ']') depth--;
-            }
-        }
-    }
 
     private void addNote(double time, int lane, boolean mustHit, double sustain) {
         if (lane < 0) lane = 0;
@@ -1274,19 +947,97 @@ private List<Path> findChartFiles(String song) throws IOException {
             count = laneCount;
         }
 
-        double visibleTopTime = songTime - (MISS_DRAW_PADDING / finalSpeed) - 200.0;
-        double visibleBottomTime = songTime + ((SCREEN_H - HIT_Y) / finalSpeed) + 200.0;
+        if (!MainMenu.batchedRenderer) {
+            // ORIGINAL per-note rendering
+            double visibleTopTime = songTime - (MISS_DRAW_PADDING / finalSpeed) - 200.0;
+            double visibleBottomTime = songTime + ((SCREEN_H - HIT_Y) / finalSpeed) + 200.0;
+
+            for (int lane = 0; lane < count; lane++) {
+                double x = baseX + (lane * layout.spacing);
+                LaneStream stream = laneArr[lane];
+                int start = Math.max(stream.hitCursor(), stream.lowerBound(visibleTopTime));
+                int end = stream.lowerBound(visibleBottomTime);
+                for (int j = start; j < end; j++) {
+                    double noteTime = stream.timeAt(j);
+                    double y = HIT_Y + (noteTime - songTime) * finalSpeed;
+                    if (y > -MISS_DRAW_PADDING && y < SCREEN_H + MISS_DRAW_PADDING) {
+                        drawImageScaled(g2, getComing(dirs[lane]), x, y, layout.noteSize, layout.noteSize);
+                    }
+                }
+            }
+            return;
+        }
+
+        // BATCHED RENDERING FOR 1M+ NOTES
+        final int DENSE_THRESHOLD = 5000;
+        final int GROUP_TOL = 3;
 
         for (int lane = 0; lane < count; lane++) {
-            double x = baseX + (lane * layout.spacing);
             LaneStream stream = laneArr[lane];
-            int start = Math.max(stream.hitCursor(), stream.lowerBound(visibleTopTime));
-            int end = stream.lowerBound(visibleBottomTime);
-            for (int j = start; j < end; j++) {
-                double noteTime = stream.timeAt(j);
-                double y = HIT_Y + (noteTime - songTime) * finalSpeed;
-                if (y > -MISS_DRAW_PADDING && y < SCREEN_H + MISS_DRAW_PADDING) {
-                    drawImageScaled(g2, getComing(dirs[lane]), x, y, layout.noteSize, layout.noteSize);
+            BufferedImage img = getComing(dirs[lane]);
+            double x = baseX + lane * layout.spacing;
+            
+            int start = Math.max(stream.hitCursor(), stream.lowerBound(songTime - 500));
+            int end = stream.lowerBound(songTime + 2000);
+            int visible = end - start;
+            if (visible <= 0) continue;
+            
+            // Ultra dense mode: draw single bar
+            if (visible > DENSE_THRESHOLD) {
+                g2.setColor(new Color(100, 180, 255, 90));
+                double topY = HIT_Y + (stream.timeAt(start) - songTime) * finalSpeed;
+                double botY = HIT_Y + (stream.timeAt(end-1) - songTime) * finalSpeed;
+                g2.fillRect((int)x, (int)topY, (int)layout.noteSize, (int)Math.max(2, botY - topY));
+                g2.setColor(new Color(255,255,255,30));
+                for (int i = start; i < end; i += Math.max(1, visible/100)) {
+                    double y = HIT_Y + (stream.timeAt(i) - songTime) * finalSpeed;
+                    g2.fillRect((int)x, (int)y, (int)layout.noteSize, 2);
+                }
+                continue;
+            }
+            
+            // Group close notes
+            double lastY = Double.NEGATIVE_INFINITY;
+            double groupStart = 0;
+            int groupCount = 0;
+            
+            for (int i = start; i < end; i++) {
+                double time = stream.timeAt(i);
+                double y = HIT_Y + (time - songTime) * finalSpeed;
+                if (y < -120 || y > 840) continue;
+                
+                if (Math.abs(y - lastY) <= GROUP_TOL && groupCount > 0) {
+                    groupCount++;
+                } else {
+                    if (groupCount > 0) {
+                        double h = lastY - groupStart + layout.noteSize;
+                        if (h <= layout.noteSize * 1.5) {
+                            drawImageScaled(g2, img, x, groupStart, layout.noteSize, layout.noteSize);
+                        } else {
+                            g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.85f));
+                            drawImageScaled(g2, img, x, groupStart, layout.noteSize, layout.noteSize);
+                            drawImageScaled(g2, img, x, groupStart + h - layout.noteSize, layout.noteSize, layout.noteSize);
+                            g2.setColor(new Color(80, 150, 255, 180));
+                            g2.fillRect((int)x + 4, (int)(groupStart + layout.noteSize), (int)layout.noteSize - 8, (int)(h - layout.noteSize*2));
+                            g2.setComposite(AlphaComposite.SrcOver);
+                        }
+                    }
+                    groupStart = y;
+                    groupCount = 1;
+                }
+                lastY = y;
+            }
+            if (groupCount > 0) {
+                double h = lastY - groupStart + layout.noteSize;
+                if (h <= layout.noteSize * 1.5) {
+                    drawImageScaled(g2, img, x, groupStart, layout.noteSize, layout.noteSize);
+                } else {
+                    g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.85f));
+                    drawImageScaled(g2, img, x, groupStart, layout.noteSize, layout.noteSize);
+                    drawImageScaled(g2, img, x, groupStart + h - layout.noteSize, layout.noteSize, layout.noteSize);
+                    g2.setColor(new Color(80, 150, 255, 180));
+                    g2.fillRect((int)x + 4, (int)(groupStart + layout.noteSize), (int)layout.noteSize - 8, (int)(h - layout.noteSize*2));
+                    g2.setComposite(AlphaComposite.SrcOver);
                 }
             }
         }
